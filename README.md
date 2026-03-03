@@ -11,6 +11,12 @@ to a theoretical Gaussian profile (Pearson correlation).
 ## Installation
 
 ```bash
+pip install git+https://github.com/aozalevsky/jqscore
+```
+
+Soon will be available for installation from PyPI:
+
+```bash
 pip install jqscore          # CPU (default JAX backend)
 pip install jqscore[gpu]     # CUDA GPU
 ```
