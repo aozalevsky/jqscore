@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jqscore"
+version = "0.1.0"
+description = "JAX reimplementation of Q-score (github.com/gregdp/mapq)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+maintainers = [
+    { name = "Arthur Zalevsky", email = "aozalevsky@gmail.com" }
+]
+dependencies = [
+    "numpy",
+    "scipy",
+    "jax",
+    "mrcfile",
+    "biotite",
+]
+
+[project.optional-dependencies]
+gpu = ["jax[cuda13]"]
+
+[project.scripts]
+jqscore = "jqscore:_cli"
+jqscore-cmd = "jqscore.jqscore_cmd:_mapq_cli"
+
+[project.urls]
+Homepage = "https://github.com/arthurb/jqscore"
+Repository = "https://github.com/arthurb/jqscore"
+Issues = "https://github.com/arthurb/jqscore/issues"
+
+[tool.setuptools.packages.find]
+include = ["jqscore*"]
