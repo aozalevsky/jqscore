@@ -26,6 +26,7 @@ gpu = ["jax[cuda13]"]
 [project.scripts]
 jqscore = "jqscore:_cli"
 jqscore-cmd = "jqscore.jqscore_cmd:_mapq_cli"
+compare-qscores = "jqscore.compare:main"
 
 [project.urls]
 Homepage = "https://github.com/arthurb/jqscore"

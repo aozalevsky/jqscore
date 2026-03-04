@@ -14,6 +14,7 @@ from .jqscore import (
     backend,
     _cli,  # re-exported for the `jqscore` console_scripts entry point
 )
+from .compare import CompareResult, read_qscores, compare_qscores
 
 __all__ = [
     "AtomRecord",
@@ -27,4 +28,7 @@ __all__ = [
     "residue_qscores",
     "chain_qscores",
     "backend",
+    "CompareResult",
+    "read_qscores",
+    "compare_qscores",
 ]
