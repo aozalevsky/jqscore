@@ -50,6 +50,7 @@ from math import sqrt
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
+from scipy.ndimage import shift as _ndimage_shift
 from scipy.spatial import cKDTree
 
 try:
@@ -416,9 +417,9 @@ def _trilinear(data, origin, voxel_size, pts):
     iy = jnp.floor(gy).astype(jnp.int32)
     iz = jnp.floor(gz).astype(jnp.int32)
 
-    fx = (gx - ix).astype(jnp.float32)
-    fy = (gy - iy).astype(jnp.float32)
-    fz = (gz - iz).astype(jnp.float32)
+    fx = gx - ix
+    fy = gy - iy
+    fz = gz - iz
 
     inside = (
         (ix >= 0) & (ix <= nx - 2) &
@@ -440,7 +441,7 @@ def _trilinear(data, origin, voxel_size, pts):
       + data[cz + 1, cy + 1, cx    ] * (1 - fx) *      fy  *      fz
       + data[cz + 1, cy + 1, cx + 1] *      fx  *      fy  *      fz
     )
-    return jnp.where(inside, v, jnp.float32(0.0))
+    return jnp.where(inside, v, 0.0)
 
 
 def _masked_pearson(d, g, mask):
@@ -496,9 +497,9 @@ def _make_compute_fn(n_gen: int, num_pts: int):
                     sphere_dirs, shell_radii, gv_shells, gv_r0):
 
         val_r0  = _trilinear(data, origin, voxel_size, atom_coord[None, :])[0]
-        d_r0    = jnp.full((n_gen,), val_r0,  dtype=jnp.float32)
-        g_r0    = jnp.full((n_gen,), gv_r0,   dtype=jnp.float32)
-        mask_r0 = jnp.ones((n_gen,),           dtype=jnp.bool_)
+        d_r0    = jnp.full((n_gen,), val_r0, dtype=jnp.float32)
+        g_r0    = jnp.full((n_gen,), gv_r0, dtype=jnp.float32)
+        mask_r0 = jnp.ones((n_gen,), dtype=jnp.bool_)
 
         def _shell(_, xs):
             r, gv = xs
@@ -582,8 +583,8 @@ def _make_compute_fn_retry(num_pts: int, max_retries: int = 50):
 
         val_r0  = _trilinear(data, origin, voxel_size, atom_coord[None, :])[0]
         d_r0    = jnp.full((num_pts,), val_r0, dtype=jnp.float32)
-        g_r0    = jnp.full((num_pts,), gv_r0,  dtype=jnp.float32)
-        mask_r0 = jnp.ones( (num_pts,),         dtype=jnp.bool_)
+        g_r0    = jnp.full((num_pts,), gv_r0, dtype=jnp.float32)
+        mask_r0 = jnp.ones((num_pts,), dtype=jnp.bool_)
 
         def _shell(_, xs):
             r, gv = xs
@@ -625,7 +626,7 @@ def _make_compute_fn_retry(num_pts: int, max_retries: int = 50):
                 return (attempt + jnp.int32(1), found | use, new_d, new_ok)
 
             _, _, d_vals, ok_mask = lax.while_loop(_cond, _body, init)
-            g_vals = jnp.full((max_n_try,), gv, dtype=jnp.float32)
+            g_vals = jnp.full((max_n_try,), gv)
 
             return None, (d_vals, g_vals, ok_mask)
 
@@ -689,6 +690,62 @@ def _build_neighbour_lists(
 
 
 # ---------------------------------------------------------------------------
+# MapQ compatibility: replicate MaskMapResize origin rounding
+# ---------------------------------------------------------------------------
+
+def _resample_mapq_compat(
+    data: np.ndarray,
+    origin: np.ndarray,
+    voxel_size: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Resample the map to replicate MapQ's MaskMapResize trimmed-map effect.
+
+    MapQ creates a per-subprocess trimmed map whose origin is rounded to
+    ``round(nO/step)*step`` using float32 arithmetic (Chimera reads MRC
+    headers in float32).  This origin is not in general aligned with the
+    original voxel grid, introducing a fixed fractional voxel offset that
+    acts as a slight blur.  The subprocess then interpolates *this* map,
+    giving double interpolation in total.
+
+    This function reproduces that effect for the whole map so that jqscore
+    queries the same blurred densities that MapQ does.
+
+    The fractional offset depends only on ``O_orig / step mod 1`` — it is
+    identical across all MapQ subprocesses and all atoms.
+
+    Parameters
+    ----------
+    data : (nz, ny, nx) float32
+    origin, voxel_size : (3,) float64 — map coordinate system (x, y, z)
+
+    Returns
+    -------
+    resampled : (nz, ny, nx) float32 — blurred map
+    new_origin : (3,) float64 — rounded origin to pass to JAX
+    """
+    # Chimera reads MRC origin/step in float32 — replicate that precision
+    O  = origin.astype(np.float32).astype(np.float64)
+    vs = voxel_size.astype(np.float32).astype(np.float64)
+
+    # MaskMapResize: ox = round(nO[0]/step)*step  (same fractional offset for all procs)
+    new_origin = np.round(O / vs) * vs  # (3,) float64
+
+    # Fractional shift in original voxel space (x, y, z)
+    offset_xyz = (new_origin - O) / vs
+
+    # scipy.ndimage.shift: output[iz,iy,ix] = input[iz-sz, iy-sy, ix-sx]
+    # We want:             output[iz,iy,ix] = input[iz+dz, iy+dy, ix+dx]
+    # so shift = [-dz, -dy, -dx]  (note data layout is z,y,x)
+    shift_zyx = np.array([-offset_xyz[2], -offset_xyz[1], -offset_xyz[0]], dtype=np.float64)
+
+    resampled = _ndimage_shift(
+        data, shift_zyx, order=1, prefilter=False, mode="constant", cval=0.0,
+    )
+
+    return resampled.astype(np.float32), new_origin
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -705,6 +762,7 @@ def compute_qscores(
     max_retries: int = 50,
     n_gen: Optional[int] = None,
     nbr_radius: Optional[float] = None,
+    mapq_compat: bool = True,
     verbose: bool = False,
 ) -> QScoreResult:
     """Compute per-atom Q-scores using JAX (GPU by default, CPU fallback).
@@ -741,6 +799,17 @@ def compute_qscores(
     nbr_radius : float, optional
         Radius (Å) for the CPU neighbour search.
         Default: ``to_rad * 2.0``.
+    mapq_compat : bool, default True
+        Resample the map to match MapQ's ``MaskMapResize`` behavior before
+        computing Q-scores.  MapQ rounds the trimmed-map origin to the nearest
+        multiple of the voxel size (using float32 arithmetic), introducing a
+        fixed fractional voxel offset that slightly blurs the map.  Enabling
+        this option replicates that effect so that Q-scores match MapQ's output
+        to within float32 rounding (~1e-4).
+
+        Set to ``False`` for the physically more accurate computation (single
+        interpolation directly from the original map).  See
+        ``docs/jqscore_vs_mapq/mapq_trimmed_map_discrepancy.md`` for details.
     verbose : bool
         Print progress information.
 
@@ -762,6 +831,11 @@ def compute_qscores(
     B     = float(min_d)
     gv_r0 = float(A + B)
 
+    if mapq_compat:
+        if verbose:
+            print("[mapq_compat] Resampling map to replicate MaskMapResize origin rounding …")
+        data, origin = _resample_mapq_compat(data, origin, voxel_size)
+
     non_h_mask    = np.array([a.element != "H" for a in atoms], dtype=bool)
     non_h_indices = np.where(non_h_mask)[0]
 
@@ -769,13 +843,12 @@ def compute_qscores(
         warnings.warn("No non-hydrogen atoms found.")
         return QScoreResult(atoms, np.full(len(atoms), np.nan), min_d, max_d, sigma)
 
-    all_coords   = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float64)
-    non_h_coords = all_coords[non_h_mask].astype(np.float32)
+    all_coords   = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float32)
+    non_h_coords = all_coords[non_h_mask]
     N            = len(non_h_indices)
 
     shell_radii_np = np.arange(d_rad, to_rad + 1e-6, d_rad, dtype=np.float32)
-    gv_shells_np   = (A * np.exp(-0.5 * (shell_radii_np / sigma) ** 2) + B
-                      ).astype(np.float32)
+    gv_shells_np   = A * np.exp(-0.5 * (shell_radii_np / sigma) ** 2) + B
 
     if verbose:
         mode_str = "retry" if use_retry else f"fast (n_gen={n_gen or max(num_pts*16,128)})"
@@ -792,7 +865,7 @@ def compute_qscores(
     jnbrc   = jnp.array(nbr_coords_np)
     jnbrv   = jnp.array(nbr_valid_np)
     jradii  = jnp.array(shell_radii_np)
-    jgv     = jnp.array(gv_shells_np)
+    jgv     = jnp.array(gv_shells_np.astype(np.float32))
     jgv_r0  = jnp.float32(gv_r0)
 
     if verbose:
@@ -850,6 +923,7 @@ def run(
     max_retries: int = 50,
     n_gen: Optional[int] = None,
     nbr_radius: Optional[float] = None,
+    mapq_compat: bool = True,
     verbose: bool = False,
 ) -> QScoreResult:
     """Compute Q-scores from file paths using the JAX backend.
@@ -860,7 +934,8 @@ def run(
         Path to a PDB (``.pdb``) or mmCIF (``.cif`` / ``.mmcif``) file.
     map_path : str
         Path to an MRC / CCP4 density map.
-    sigma, num_pts, to_rad, d_rad, use_retry, max_retries, n_gen, nbr_radius, verbose
+    sigma, num_pts, to_rad, d_rad, use_retry, max_retries, n_gen, nbr_radius,
+    mapq_compat, verbose
         Forwarded to :func:`compute_qscores`.
 
     Returns
@@ -879,7 +954,8 @@ def run(
         atoms, data, origin, voxel_size,
         sigma=sigma, num_pts=num_pts, to_rad=to_rad, d_rad=d_rad,
         use_retry=use_retry, max_retries=max_retries,
-        n_gen=n_gen, nbr_radius=nbr_radius, verbose=verbose,
+        n_gen=n_gen, nbr_radius=nbr_radius,
+        mapq_compat=mapq_compat, verbose=verbose,
     )
 
 
@@ -982,6 +1058,10 @@ def _cli() -> None:
                         help="Max retry attempts per shell (default 50)")
     parser.add_argument("--n-gen",       type=int,   default=None,
                         help="Sphere-point budget per shell for --no-retry mode")
+    parser.add_argument("--no-mapq-compat", action="store_true",
+                        help="Disable MapQ trimmed-map resampling (more accurate, "
+                             "but Q-scores may differ from MapQ by up to ~0.18 "
+                             "for atoms in unusual density environments)")
     parser.add_argument("--verbose",     action="store_true",
                         help="Print per-atom Q-scores during computation")
     parser.add_argument("--output",      default=None,
@@ -996,6 +1076,7 @@ def _cli() -> None:
         use_retry=not args.no_retry,
         max_retries=args.max_retries,
         n_gen=args.n_gen,
+        mapq_compat=not args.no_mapq_compat,
         verbose=args.verbose,
     )
 
