@@ -763,6 +763,7 @@ def compute_qscores(
     n_gen: Optional[int] = None,
     nbr_radius: Optional[float] = None,
     mapq_compat: bool = True,
+    batch_size: Optional[int] = 2048,
     verbose: bool = False,
 ) -> QScoreResult:
     """Compute per-atom Q-scores using JAX (GPU by default, CPU fallback).
@@ -810,6 +811,11 @@ def compute_qscores(
         Set to ``False`` for the physically more accurate computation (single
         interpolation directly from the original map).  See
         ``docs/jqscore_vs_mapq/mapq_trimmed_map_discrepancy.md`` for details.
+    batch_size : int or None, default 2048
+        Number of atoms to process per JAX kernel call.  The kernel's peak GPU
+        memory (including XLA compilation overhead) grows with this value.
+        Reduce for tight GPUs; set to ``None`` to process all atoms in a single
+        call (may OOM for large structures).
     verbose : bool
         Print progress information.
 
@@ -861,42 +867,67 @@ def compute_qscores(
     jdata   = jnp.array(data.astype(np.float32))
     jorigin = jnp.array(origin.astype(np.float32))
     jvs     = jnp.array(voxel_size.astype(np.float32))
-    jcoords = jnp.array(non_h_coords)
-    jnbrc   = jnp.array(nbr_coords_np)
-    jnbrv   = jnp.array(nbr_valid_np)
     jradii  = jnp.array(shell_radii_np)
     jgv     = jnp.array(gv_shells_np.astype(np.float32))
     jgv_r0  = jnp.float32(gv_r0)
 
+    K = nbr_coords_np.shape[1]
+
     if verbose:
         n_shells = len(shell_radii_np)
-        K        = nbr_coords_np.shape[1]
         print(
             f"Computing Q-scores:  {N} atoms  ×  {n_shells} shells  "
             f"(max {K} neighbours/atom)"
         )
 
+    # None = legacy single-call (may OOM for large structures)
+    effective_batch = N if batch_size is None else max(1, batch_size)
+
     if use_retry:
         compute_fn = _get_compute_fn_retry(num_pts, max_retries)
-        q_non_h = np.array(
-            compute_fn(
-                jcoords, jnbrc, jnbrv,
-                jdata, jorigin, jvs,
-                jradii, jgv, jgv_r0,
-            )
-        )
+        jdirs = None
     else:
         if n_gen is None:
             n_gen = max(num_pts * 16, 128)
         jdirs = jnp.array(_sphere_directions(n_gen).astype(np.float32))
         compute_fn = _get_compute_fn(n_gen, num_pts)
-        q_non_h = np.array(
-            compute_fn(
-                jcoords, jnbrc, jnbrv,
-                jdata, jorigin, jvs,
-                jdirs, jradii, jgv, jgv_r0,
-            )
-        )
+
+    def _call_compute(bcoords_j, bc_j, bv_j):
+        if use_retry:
+            return compute_fn(bcoords_j, bc_j, bv_j, jdata, jorigin, jvs, jradii, jgv, jgv_r0)
+        else:
+            return compute_fn(bcoords_j, bc_j, bv_j, jdata, jorigin, jvs, jdirs, jradii, jgv, jgv_r0)
+
+    if effective_batch >= N:
+        if verbose and effective_batch < 2 * N:
+            print(f"  No batching needed ({N} atoms fit in one call)")
+        q_non_h = np.array(_call_compute(
+            jnp.array(non_h_coords),
+            jnp.array(nbr_coords_np),
+            jnp.array(nbr_valid_np),
+        ))
+    else:
+        if verbose:
+            n_batches = (N + effective_batch - 1) // effective_batch
+            print(f"  Batching: {effective_batch} atoms/batch ({n_batches} batches)")
+        q_non_h = np.empty(N, dtype=np.float32)
+        for start in range(0, N, effective_batch):
+            actual   = min(start + effective_batch, N)
+            bc_np    = nbr_coords_np[start:actual]
+            bv_np    = nbr_valid_np[start:actual]
+            coord_np = non_h_coords[start:actual]
+            if actual < start + effective_batch:
+                # Pad last batch to fixed shape to avoid JIT recompilation
+                pad      = start + effective_batch - actual
+                bc_np    = np.concatenate([bc_np,    np.zeros((pad, K, 3), dtype=np.float32)])
+                bv_np    = np.concatenate([bv_np,    np.zeros((pad, K),    dtype=np.bool_)])
+                coord_np = np.concatenate([coord_np, np.zeros((pad, 3),    dtype=np.float32)])
+            batch_q = np.array(_call_compute(
+                jnp.array(coord_np),
+                jnp.array(bc_np),
+                jnp.array(bv_np),
+            ))
+            q_non_h[start:actual] = batch_q[:actual - start]
 
     q_scores = np.full(len(atoms), np.nan, dtype=np.float64)
     q_scores[non_h_indices] = q_non_h.astype(np.float64)
@@ -924,6 +955,7 @@ def run(
     n_gen: Optional[int] = None,
     nbr_radius: Optional[float] = None,
     mapq_compat: bool = True,
+    batch_size: Optional[int] = 2048,
     verbose: bool = False,
 ) -> QScoreResult:
     """Compute Q-scores from file paths using the JAX backend.
@@ -955,7 +987,7 @@ def run(
         sigma=sigma, num_pts=num_pts, to_rad=to_rad, d_rad=d_rad,
         use_retry=use_retry, max_retries=max_retries,
         n_gen=n_gen, nbr_radius=nbr_radius,
-        mapq_compat=mapq_compat, verbose=verbose,
+        mapq_compat=mapq_compat, batch_size=batch_size, verbose=verbose,
     )
 
 
@@ -1062,6 +1094,9 @@ def _cli() -> None:
                         help="Disable MapQ trimmed-map resampling (more accurate, "
                              "but Q-scores may differ from MapQ by up to ~0.18 "
                              "for atoms in unusual density environments)")
+    parser.add_argument("--batch-size",  type=int, default=2048,
+                        help="Atoms per JAX kernel call (default 2048). "
+                             "Reduce for tight GPUs.")
     parser.add_argument("--verbose",     action="store_true",
                         help="Print per-atom Q-scores during computation")
     parser.add_argument("--output",      default=None,
@@ -1077,6 +1112,7 @@ def _cli() -> None:
         max_retries=args.max_retries,
         n_gen=args.n_gen,
         mapq_compat=not args.no_mapq_compat,
+        batch_size=args.batch_size,
         verbose=args.verbose,
     )
 
