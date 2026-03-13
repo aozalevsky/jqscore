@@ -27,12 +27,13 @@ class CompareResult:
 
 
 def read_qscores(cif_path: str) -> tuple:
-    """Read structure and Q-score column from a jqscore output CIF.
+    """Read structure and Q-score column from a jqscore or MapQ output CIF.
 
     Parameters
     ----------
     cif_path : str
-        Path to a CIF file with ``_atom_site.Q-score``.
+        Path to a CIF file with ``_atom_site.Q-score`` (jqscore) or
+        ``_atom_site.Q_score`` (MapQ).
 
     Returns
     -------
@@ -40,10 +41,17 @@ def read_qscores(cif_path: str) -> tuple:
     qscores : ndarray of float64 (NaN where missing)
     """
     cif = pdbx.CIFFile.read(cif_path)
-    structure = pdbx.get_structure(cif, model=1, altloc="all", extra_fields=["Q-score"])
-    if "Q-score" not in structure.get_annotation_categories():
-        raise ValueError(f"No _atom_site.Q-score in {cif_path}")
-    raw = structure.get_annotation("Q-score")
+    # Try jqscore format first ("Q-score"), then MapQ format ("Q_score")
+    for field in ("Q-score", "Q_score"):
+        try:
+            structure = pdbx.get_structure(cif, model=1, altloc="all", extra_fields=[field])
+            if field in structure.get_annotation_categories():
+                raw = structure.get_annotation(field)
+                break
+        except (KeyError, Exception):
+            continue
+    else:
+        raise ValueError(f"No _atom_site.Q-score or _atom_site.Q_score in {cif_path}")
     out = np.full(len(raw), np.nan, dtype=np.float64)
     for i, s in enumerate(raw):
         s = str(s).strip()

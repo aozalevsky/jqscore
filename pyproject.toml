@@ -22,6 +22,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["jax[cuda13]"]
+test = ["pytest>=7.0"]
 
 [project.scripts]
 jqscore = "jqscore:_cli"
@@ -32,6 +33,9 @@ compare-qscores = "jqscore.compare:main"
 Homepage = "https://github.com/arthurb/jqscore"
 Repository = "https://github.com/arthurb/jqscore"
 Issues = "https://github.com/arthurb/jqscore/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 include = ["jqscore*"]
