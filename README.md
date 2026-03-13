@@ -1,5 +1,8 @@
 # jqscore
 
+[![Tests](https://github.com/aozalevsky/jqscore/actions/workflows/tests.yml/badge.svg)](https://github.com/aozalevsky/jqscore/actions/workflows/tests.yml)
+![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
+
 JAX reimplementation of [Q-score](https://github.com/gregdp/mapq) — a per-atom cryo-EM map-to-model fit metric.
 
 Q-score measures how well each atom in an atomic model fits into a cryo-EM
