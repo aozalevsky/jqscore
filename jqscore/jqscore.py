@@ -54,17 +54,10 @@ from scipy.ndimage import shift as _ndimage_shift
 from scipy.spatial import cKDTree
 
 try:
-    import mrcfile
-    _HAVE_MRCFILE = True
+    import gemmi
+    _HAVE_GEMMI = True
 except ImportError:
-    _HAVE_MRCFILE = False
-
-try:
-    import biotite.structure.io.pdb as _biotite_pdb
-    import biotite.structure.io.pdbx as _biotite_pdbx
-    _HAVE_BIOTITE = True
-except ImportError:
-    _HAVE_BIOTITE = False
+    _HAVE_GEMMI = False
 
 try:
     import jax
@@ -123,35 +116,41 @@ def read_mrc(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     Raises
     ------
     ImportError
-        If the ``mrcfile`` package is not installed.
+        If the ``gemmi`` package is not installed.
     """
-    if not _HAVE_MRCFILE:
-        raise ImportError("mrcfile is required to read MRC maps: pip install mrcfile")
+    if not _HAVE_GEMMI:
+        raise ImportError("gemmi is required to read MRC maps: pip install gemmi")
 
-    with mrcfile.open(path, mode="r", permissive=True) as mrc:
-        raw = mrc.data.copy()
+    m = gemmi.read_ccp4_map(path)
+    g = m.grid
+    uc = g.unit_cell
 
-        vs = mrc.voxel_size
-        voxel_size = np.array([float(vs.x), float(vs.y), float(vs.z)], dtype=np.float64)
+    voxel_size = np.array([uc.a / g.nu, uc.b / g.nv, uc.c / g.nw], dtype=np.float64)
 
-        orig = mrc.header.origin
-        origin = np.array([float(orig.x), float(orig.y), float(orig.z)], dtype=np.float64)
+    # MRC2000 origin (header words 50-52)
+    origin = np.array(
+        [m.header_float(50), m.header_float(51), m.header_float(52)],
+        dtype=np.float64,
+    )
 
-        # Fall back to nxstart / nystart / nzstart for old CCP4 files
-        if np.all(origin == 0.0) and voxel_size[0] > 0:
-            origin = np.array([
-                int(mrc.header.nxstart) * voxel_size[0],
-                int(mrc.header.nystart) * voxel_size[1],
-                int(mrc.header.nzstart) * voxel_size[2],
-            ], dtype=np.float64)
+    # Fall back to nxstart / nystart / nzstart (words 5-7) for old CCP4 files
+    if np.all(origin == 0.0) and voxel_size[0] > 0:
+        origin = np.array([
+            m.header_i32(5) * voxel_size[0],
+            m.header_i32(6) * voxel_size[1],
+            m.header_i32(7) * voxel_size[2],
+        ], dtype=np.float64)
 
-        mapc = int(mrc.header.mapc)
-        mapr = int(mrc.header.mapr)
-        maps = int(mrc.header.maps)
+    # Axis mapping (header words 17-19): MAPC, MAPR, MAPS
+    mapc = m.header_i32(17)
+    mapr = m.header_i32(18)
+    maps = m.header_i32(19)
 
-    data = raw.astype(np.float32)
+    # gemmi grid shape = (nu, nv, nw) = (NC, NR, NS); transpose to (NS, NR, NC)
+    # then reorder from file order to ZYX, same logic as the old mrcfile path.
+    raw = np.array(g, copy=True).astype(np.float32)
+    data = np.ascontiguousarray(raw.transpose(2, 1, 0))  # (NC,NR,NS) → (NS,NR,NC)
 
-    # mrcfile gives data.shape = (ns, nr, nc); reorder to ZYX.
     axis_to_cart = {0: maps, 1: mapr, 2: mapc}
     cart_to_axis = {v: k for k, v in axis_to_cart.items()}
     transpose_order = (cart_to_axis[3], cart_to_axis[2], cart_to_axis[1])
@@ -165,62 +164,48 @@ def read_mrc(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 # Structure I/O
 # ---------------------------------------------------------------------------
 
-def _structure_to_atom_records(structure) -> List[AtomRecord]:
-    """Convert a biotite AtomArray (or single model from AtomArrayStack) to AtomRecords."""
-    if not _HAVE_BIOTITE:
-        raise ImportError("biotite is required for structure I/O: pip install biotite")
-    # Handle AtomArrayStack: take first model
-    if hasattr(structure, "stack_depth") and structure.stack_depth() > 0:
-        structure = structure[0]
-    n = structure.array_length()
-    categories = structure.get_annotation_categories()
-    coords = structure.coord
-    chain_id = structure.chain_id
-    res_id = structure.res_id
-    res_name = structure.res_name
-    atom_name = structure.atom_name
-    element = structure.element if "element" in categories else None
-    ins_code = structure.ins_code if "ins_code" in categories else None
-    alt_loc_id = structure.alt_loc_id if "alt_loc_id" in categories else None
+def _gemmi_model_to_atom_records(model) -> List[AtomRecord]:
+    """Convert atoms from the first model of a gemmi.Structure to AtomRecords.
 
+    All alternate conformations are included (matching biotite ``altloc="all"``).
+    """
     records: List[AtomRecord] = []
-    for i in range(n):
-        el = str(element[i]).strip().upper() if element is not None else ""
-        if not el and atom_name is not None:
-            an = str(atom_name[i]).strip()
-            el = an.lstrip("0123456789").lstrip()[0].upper() if an else ""
-        x, y, z = float(coords[i, 0]), float(coords[i, 1]), float(coords[i, 2])
-        ins = str(ins_code[i]).strip().replace("?", "").replace(".", "") if ins_code is not None else ""
-        alt = str(alt_loc_id[i]).strip().replace("?", "").replace(".", "") if alt_loc_id is not None else ""
-        records.append(AtomRecord(
-            chain_id=str(chain_id[i]).strip(),
-            res_seq=int(res_id[i]),
-            ins_code=ins,
-            res_name=str(res_name[i]).strip(),
-            atom_name=str(atom_name[i]).strip(),
-            element=el,
-            x=x, y=y, z=z,
-            alt_loc=alt,
-        ))
+    for chain in model:
+        for res in chain:
+            for atom in res:
+                el = atom.element.name.strip().upper()
+                if not el:
+                    an = atom.name.strip()
+                    el = an.lstrip("0123456789").lstrip()[0].upper() if an else ""
+                alt = atom.altloc if atom.altloc not in ('\x00', ' ', '') else ""
+                ins = res.seqid.icode.strip() if res.seqid.icode not in (' ', '\x00') else ""
+                records.append(AtomRecord(
+                    chain_id=chain.name,
+                    res_seq=res.seqid.num,
+                    ins_code=ins,
+                    res_name=res.name,
+                    atom_name=atom.name,
+                    element=el,
+                    x=atom.pos.x, y=atom.pos.y, z=atom.pos.z,
+                    alt_loc=alt,
+                ))
     return records
 
 
 def read_pdb(path: str) -> List[AtomRecord]:
     """Parse a PDB file and return ATOM / HETATM records (first model only)."""
-    if not _HAVE_BIOTITE:
-        raise ImportError("biotite is required for structure I/O: pip install biotite")
-    pdb_file = _biotite_pdb.PDBFile.read(path)
-    structure = pdb_file.get_structure(model=1, altloc="all")
-    return _structure_to_atom_records(structure)
+    if not _HAVE_GEMMI:
+        raise ImportError("gemmi is required for structure I/O: pip install gemmi")
+    st = gemmi.read_structure(path)
+    return _gemmi_model_to_atom_records(st[0])
 
 
 def read_cif(path: str) -> List[AtomRecord]:
     """Parse an mmCIF file and return atom_site records (first model only)."""
-    if not _HAVE_BIOTITE:
-        raise ImportError("biotite is required for structure I/O: pip install biotite")
-    cif_file = _biotite_pdbx.CIFFile.read(path)
-    structure = _biotite_pdbx.get_structure(cif_file, model=1, altloc="all")
-    return _structure_to_atom_records(structure)
+    if not _HAVE_GEMMI:
+        raise ImportError("gemmi is required for structure I/O: pip install gemmi")
+    st = gemmi.read_structure(path)
+    return _gemmi_model_to_atom_records(st[0])
 
 
 # ---------------------------------------------------------------------------
@@ -1003,8 +988,8 @@ def write_qscore_cif(
 ) -> str:
     """Write a mapq-compatible mmCIF file with an ``_atom_site.Q-score`` column.
 
-    Reads *input_cif_path* with biotite, adds Q-scores from *result* as an
-    ``_atom_site.Q-score`` annotation, and writes via biotite's CIF writer to::
+    Reads *input_cif_path* with gemmi, adds Q-scores from *result* as an
+    ``_atom_site.Q-score`` column, and writes the modified CIF to::
 
         {output_dir}/{cif_basename}__Q__{map_basename}.cif
 
@@ -1030,8 +1015,8 @@ def write_qscore_cif(
     """
     import os
 
-    if not _HAVE_BIOTITE:
-        raise ImportError("biotite is required for CIF output: pip install biotite")
+    if not _HAVE_GEMMI:
+        raise ImportError("gemmi is required for CIF output: pip install gemmi")
 
     cif_basename = os.path.basename(input_cif_path)
     map_basename = os.path.basename(map_path)
@@ -1039,27 +1024,32 @@ def write_qscore_cif(
         output_dir = os.path.dirname(os.path.abspath(input_cif_path))
     out_path = os.path.join(output_dir, f"{cif_basename}__Q__{map_basename}.cif")
 
-    cif_file = _biotite_pdbx.CIFFile.read(input_cif_path)
-    structure = _biotite_pdbx.get_structure(
-        cif_file, model=1, altloc="all", extra_fields=["b_factor", "occupancy"]
-    )
+    doc = gemmi.cif.read(input_cif_path)
+    block = doc[0]
 
-    if structure.array_length() != len(result.atom_qscores):
+    # Count atoms in the CIF atom_site loop
+    id_col = block.find_loop("_atom_site.id")
+    n_atoms = len(id_col) if id_col else 0
+
+    if n_atoms != len(result.atom_qscores):
         raise ValueError(
-            f"Atom count mismatch: CIF has {structure.array_length()} atoms, "
+            f"Atom count mismatch: CIF has {n_atoms} atoms, "
             f"result has {len(result.atom_qscores)}. "
             "Input CIF must not be modified between run() and write_qscore_cif()."
         )
 
-    qs = result.atom_qscores
-    qscore_col = np.array(
-        ["?" if np.isnan(x) else f"{x:.6f}" for x in qs],
-        dtype="U16",
-    )
-    structure.set_annotation("Q-score", qscore_col)
+    # Find the atom_site loop and add Q-score column
+    for item in block:
+        if item.loop and any("_atom_site" in t for t in item.loop.tags):
+            item.loop.add_columns(["_atom_site.Q-score"], "?")
+            break
 
-    _biotite_pdbx.set_structure(cif_file, structure, extra_fields=["Q-score"])
-    cif_file.write(out_path)
+    qcol = block.find_loop("_atom_site.Q-score")
+    qs = result.atom_qscores
+    for i, q in enumerate(qs):
+        qcol[i] = "?" if np.isnan(q) else f"{q:.6f}"
+
+    doc.write_file(out_path)
 
     return out_path
 

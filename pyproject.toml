@@ -16,8 +16,7 @@ dependencies = [
     "numpy",
     "scipy",
     "jax",
-    "mrcfile",
-    "biotite",
+    "gemmi",
 ]
 
 [project.optional-dependencies]

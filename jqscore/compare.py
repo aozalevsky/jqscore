@@ -6,7 +6,7 @@ import sys
 from dataclasses import dataclass
 
 import numpy as np
-import biotite.structure.io.pdbx as pdbx
+import gemmi
 
 
 @dataclass
@@ -26,6 +26,18 @@ class CompareResult:
     atom_labels: list[str]
 
 
+class _CifAtomInfo:
+    """Lightweight container for per-atom metadata read from a CIF file."""
+
+    __slots__ = ("chain_id", "res_id", "res_name", "atom_name")
+
+    def __init__(self, chain_id, res_id, res_name, atom_name):
+        self.chain_id = chain_id
+        self.res_id = res_id
+        self.res_name = res_name
+        self.atom_name = atom_name
+
+
 def read_qscores(cif_path: str) -> tuple:
     """Read structure and Q-score column from a jqscore or MapQ output CIF.
 
@@ -37,21 +49,23 @@ def read_qscores(cif_path: str) -> tuple:
 
     Returns
     -------
-    structure : biotite AtomArray
+    atom_info : _CifAtomInfo
+        Per-atom metadata (chain_id, res_id, res_name, atom_name arrays).
     qscores : ndarray of float64 (NaN where missing)
     """
-    cif = pdbx.CIFFile.read(cif_path)
+    doc = gemmi.cif.read(cif_path)
+    block = doc[0]
+
     # Try jqscore format first ("Q-score"), then MapQ format ("Q_score")
+    raw = None
     for field in ("Q-score", "Q_score"):
-        try:
-            structure = pdbx.get_structure(cif, model=1, altloc="all", extra_fields=[field])
-            if field in structure.get_annotation_categories():
-                raw = structure.get_annotation(field)
-                break
-        except (KeyError, Exception):
-            continue
-    else:
+        col = block.find_loop(f"_atom_site.{field}")
+        if col:
+            raw = list(col)
+            break
+    if raw is None:
         raise ValueError(f"No _atom_site.Q-score or _atom_site.Q_score in {cif_path}")
+
     out = np.full(len(raw), np.nan, dtype=np.float64)
     for i, s in enumerate(raw):
         s = str(s).strip()
@@ -60,13 +74,21 @@ def read_qscores(cif_path: str) -> tuple:
                 out[i] = float(s)
             except ValueError:
                 pass
-    return structure, out
+
+    # Read atom labels
+    chain_col = list(block.find_loop("_atom_site.auth_asym_id"))
+    resid_col = list(block.find_loop("_atom_site.auth_seq_id"))
+    resname_col = list(block.find_loop("_atom_site.auth_comp_id"))
+    atomname_col = list(block.find_loop("_atom_site.auth_atom_id"))
+
+    atom_info = _CifAtomInfo(chain_col, resid_col, resname_col, atomname_col)
+    return atom_info, out
 
 
-def _atom_label(structure, i: int) -> str:
+def _atom_label(atom_info, i: int) -> str:
     return (
-        f"{structure.chain_id[i]}/{structure.res_id[i]}"
-        f"/{structure.res_name[i]}/{structure.atom_name[i]}"
+        f"{atom_info.chain_id[i]}/{atom_info.res_id[i]}"
+        f"/{atom_info.res_name[i]}/{atom_info.atom_name[i]}"
     )
 
 
