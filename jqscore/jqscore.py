@@ -1038,6 +1038,52 @@ def write_qscore_cif(
             "Input CIF must not be modified between run() and write_qscore_cif()."
         )
 
+    # Build a mapping from gemmi iteration order (= result.atom_records order)
+    # to the raw CIF loop row order.  These can differ because
+    # gemmi.read_structure() groups ligand residues with their parent chain,
+    # while many CIF files list all polymer chains first then all ligands.
+    chain_col  = list(block.find_loop("_atom_site.auth_asym_id"))
+    seq_col    = list(block.find_loop("_atom_site.auth_seq_id"))
+    name_col   = list(block.find_loop("_atom_site.auth_atom_id"))
+    comp_col   = list(block.find_loop("_atom_site.auth_comp_id"))
+    alt_col    = block.find_loop("_atom_site.label_alt_id")
+    alt_list   = list(alt_col) if alt_col else [""] * n_atoms
+
+    def _atom_key(chain, seq, comp, name, alt):
+        alt = str(alt).strip()
+        if alt in (".", "?", ""):
+            alt = ""
+        return (str(chain).strip(), str(seq).strip(),
+                str(comp).strip(), str(name).strip(), alt)
+
+    # Map: key -> list of CIF row indices (handle duplicates gracefully)
+    from collections import defaultdict
+    cif_key_to_rows: dict = defaultdict(list)
+    for i in range(n_atoms):
+        k = _atom_key(chain_col[i], seq_col[i], comp_col[i], name_col[i], alt_list[i])
+        cif_key_to_rows[k].append(i)
+
+    # Build gemmi-order keys from atom_records
+    gemmi_keys = []
+    for rec in result.atom_records:
+        gemmi_keys.append(_atom_key(
+            rec.chain_id, str(rec.res_seq), rec.res_name,
+            rec.atom_name, rec.alt_loc,
+        ))
+
+    # Create mapping: gemmi index -> CIF row index
+    # Consume from each key's row list to handle duplicate keys
+    key_cursor: dict = defaultdict(int)
+    gemmi_to_cif = []
+    for gk in gemmi_keys:
+        rows = cif_key_to_rows.get(gk, [])
+        cursor = key_cursor[gk]
+        if cursor < len(rows):
+            gemmi_to_cif.append(rows[cursor])
+            key_cursor[gk] = cursor + 1
+        else:
+            gemmi_to_cif.append(-1)  # fallback: unmatched
+
     # Find the atom_site loop and add Q-score column
     for item in block:
         if item.loop and any("_atom_site" in t for t in item.loop.tags):
@@ -1046,8 +1092,10 @@ def write_qscore_cif(
 
     qcol = block.find_loop("_atom_site.Q-score")
     qs = result.atom_qscores
-    for i, q in enumerate(qs):
-        qcol[i] = "?" if np.isnan(q) else f"{q:.6f}"
+    for gemmi_idx, q in enumerate(qs):
+        cif_idx = gemmi_to_cif[gemmi_idx]
+        if cif_idx >= 0:
+            qcol[cif_idx] = "?" if np.isnan(q) else f"{q:.6f}"
 
     doc.write_file(out_path)
 
