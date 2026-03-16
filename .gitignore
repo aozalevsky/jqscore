@@ -1,3 +1,6 @@
+# Benchmark output
+jqscore_mapq_benchmark/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
