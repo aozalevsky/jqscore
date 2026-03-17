@@ -1,0 +1,20 @@
+{
+  "pdb_id": "4AQW",
+  "emdb_id": "EMD-2078",
+  "resolution": 9.5,
+  "cif_path": "cache/4AQW.cif",
+  "map_path": "cache/EMD-2078.map",
+  "jqscore_cif": "jax_gpu_4AQW.cif__Q__EMD-2078.map.cif",
+  "mapq_cif": "4AQW.cif__Q__emd_2078.map.cif",
+  "jqscore_cpu_time": 1.0527,
+  "jqscore_gpu_time": 2.0543,
+  "jqscore_cpu_compute_time": 1.0382,
+  "jqscore_gpu_compute_time": 2.0415,
+  "mapq_time": 4.270212173461914,
+  "n_non_h": 1311,
+  "pearson_r": 0.9999999999781962,
+  "diff_mean": -6.80587780355395e-08,
+  "diff_max": 3.000000000086267e-06,
+  "diff_min": -4.000000000004e-06,
+  "gpu_available": true
+}

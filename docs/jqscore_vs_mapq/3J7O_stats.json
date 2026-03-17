@@ -1,0 +1,20 @@
+{
+  "pdb_id": "3J7O",
+  "emdb_id": "EMD-2649",
+  "resolution": 3.35,
+  "cif_path": "cache/3J7O.cif",
+  "map_path": "cache/EMD-2649.map",
+  "jqscore_cif": "jax_gpu_3J7O.cif__Q__EMD-2649.map.cif",
+  "mapq_cif": "3J7O.cif__Q__emd_2649.map.cif",
+  "jqscore_cpu_time": 136.7511,
+  "jqscore_gpu_time": 12.6695,
+  "jqscore_cpu_compute_time": 135.3999,
+  "jqscore_gpu_compute_time": 11.415,
+  "mapq_time": 227.1480839252472,
+  "n_non_h": 136815,
+  "pearson_r": 0.9999979681431218,
+  "diff_mean": -3.3463962675450665e-06,
+  "diff_max": 0.023649000000000003,
+  "diff_min": -0.131009,
+  "gpu_available": true
+}

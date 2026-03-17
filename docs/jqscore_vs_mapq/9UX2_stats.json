@@ -1,0 +1,20 @@
+{
+  "pdb_id": "9UX2",
+  "emdb_id": "EMD-64570",
+  "resolution": 2.73,
+  "cif_path": "cache/9UX2.cif",
+  "map_path": "cache/EMD-64570.map",
+  "jqscore_cif": "jax_gpu_9UX2.cif__Q__EMD-64570.map.cif",
+  "mapq_cif": "9UX2.cif__Q__emd_64570.map.cif",
+  "jqscore_cpu_time": 6.1947,
+  "jqscore_gpu_time": 5.6523,
+  "jqscore_cpu_compute_time": 5.8732,
+  "jqscore_gpu_compute_time": 5.3459,
+  "mapq_time": 14.2119619846344,
+  "n_non_h": 7640,
+  "pearson_r": 0.9999995267476399,
+  "diff_mean": 1.0411138841448522e-06,
+  "diff_max": 0.0062510000000000066,
+  "diff_min": -0.009900999999999938,
+  "gpu_available": true
+}

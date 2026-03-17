@@ -1,0 +1,20 @@
+{
+  "pdb_id": "8RQB",
+  "emdb_id": "EMD-19436",
+  "resolution": 1.09,
+  "cif_path": "cache/8RQB.cif",
+  "map_path": "cache/EMD-19436.map",
+  "jqscore_cif": "jax_gpu_8RQB.cif__Q__EMD-19436.map.cif",
+  "mapq_cif": "8RQB.cif__Q__emd_19436.map.cif",
+  "jqscore_cpu_time": 62.679,
+  "jqscore_gpu_time": 13.1611,
+  "jqscore_cpu_compute_time": 61.4946,
+  "jqscore_gpu_compute_time": 12.0421,
+  "mapq_time": 96.12358832359314,
+  "n_non_h": 39996,
+  "pearson_r": 0.9999999923401476,
+  "diff_mean": -5.653065306495838e-08,
+  "diff_max": 0.0016730000000000356,
+  "diff_min": -0.0026799999999999047,
+  "gpu_available": true
+}
