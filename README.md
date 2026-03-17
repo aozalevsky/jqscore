@@ -91,6 +91,25 @@ jqscore-cmd <chimera_root> map=<mapfile> cif=<cif1> [cif=<cif2> ...] [np=<n>] [r
 
 All parameters other than the map path, structure path(s), and **sigma** are accepted for compatibility but **ignored** (e.g. `np=`, `res=`, Chimera root). The optional `sigma=<float>` sets the Gaussian width in Å (default 0.4). Output CIFs with a Q-score column are written to the current working directory as `{cif_basename}__Q__{map_basename}.cif`, matching the naming expected by VA.
 
+## Benchmarking against MapQ
+
+The included benchmark script downloads real PDB+EMDB structures, runs both the original [MapQ](https://github.com/gregdp/mapq) (via Singularity) and jqscore, and produces per-atom scatter plots, a summary comparison, and a markdown report.
+
+```bash
+# Run with default structures (7 entries):
+python -m jqscore.benchmark
+
+# Run on specific PDB IDs:
+python -m jqscore.benchmark 9XZK 9UX2
+
+# Custom output directory:
+python -m jqscore.benchmark -o my_benchmark
+```
+
+The MapQ reference is invoked via the `MAPQ_CMD` environment variable (expects a Singularity container by default). A full benchmark run with all 7 default structures takes approximately 30 minutes.
+
+Results are saved to `jqscore_mapq_benchmark/` (plots, output CIFs, and `SUMMARY.md`). See [`spec/benchmark.md`](spec/benchmark.md) for the full specification.
+
 ## License
 
 MIT
