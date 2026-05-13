@@ -1,7 +1,9 @@
 """Tests for I/O functions: read_cif, read_mrc, read_qscores, compare_qscores, write_qscore_cif."""
 
+import os
 import tempfile
 
+import gemmi
 import numpy as np
 import pytest
 
@@ -145,3 +147,40 @@ class TestWriteQscoreCif:
             )
             # NaN positions should still be NaN
             assert np.isnan(qscores_back[~valid]).all()
+
+    def test_missing_auth_atom_id_cif(self):
+        """CIFs lacking _atom_site.auth_atom_id must still round-trip.
+
+        python-ihm's ihm.dumper (used for integrative-model CIFs in the EMDB
+        VA pipeline) emits the auth_asym_id/seq_id/comp_id columns but omits
+        auth_atom_id. write_qscore_cif must fall back to label_atom_id rather
+        than IndexError on an empty list.
+        """
+        # Build a fixture from SMALL_STRUCTURE with auth_atom_id removed,
+        # mirroring the column layout python-ihm emits.
+        doc = gemmi.cif.read(str(SMALL_STRUCTURE))
+        block = doc[0]
+        for item in block:
+            if item.loop and any("_atom_site" in t for t in item.loop.tags):
+                item.loop.remove_column("_atom_site.auth_atom_id")
+                break
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            no_auth_cif = os.path.join(tmpdir, "no_auth_atom_id.cif")
+            doc.write_file(no_auth_cif)
+
+            # Sanity: auth_atom_id stripped, label_atom_id retained.
+            check = gemmi.cif.read(no_auth_cif)[0]
+            assert not list(check.find_loop("_atom_site.auth_atom_id"))
+            assert list(check.find_loop("_atom_site.label_atom_id"))
+
+            atoms = read_cif(no_auth_cif)
+            n = len(atoms)
+            fake_q = np.random.default_rng(0).uniform(0.0, 1.0, size=n)
+            result = QScoreResult(atoms, fake_q, 0.0, 1.0, 0.4)
+
+            out_path = write_qscore_cif(result, no_auth_cif, "test.map", output_dir=tmpdir)
+
+            _, qscores_back = read_qscores(out_path)
+            assert len(qscores_back) == n
+            np.testing.assert_allclose(qscores_back, fake_q, atol=1e-5)

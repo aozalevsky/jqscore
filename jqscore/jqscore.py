@@ -1042,10 +1042,20 @@ def write_qscore_cif(
     # to the raw CIF loop row order.  These can differ because
     # gemmi.read_structure() groups ligand residues with their parent chain,
     # while many CIF files list all polymer chains first then all ligands.
-    chain_col  = list(block.find_loop("_atom_site.auth_asym_id"))
-    seq_col    = list(block.find_loop("_atom_site.auth_seq_id"))
-    name_col   = list(block.find_loop("_atom_site.auth_atom_id"))
-    comp_col   = list(block.find_loop("_atom_site.auth_comp_id"))
+    # Per-column fallback to label_* when auth_* is absent or wrong-length.
+    # python-ihm's ihm.dumper omits auth_atom_id (and sometimes other auth_*
+    # columns) for integrative-model CIFs; per the mmCIF dictionary, label_*
+    # is canonical when its auth_* counterpart is omitted.
+    def _auth_or_label(auth_tag: str, label_tag: str) -> List[str]:
+        col = list(block.find_loop(auth_tag))
+        if len(col) == n_atoms:
+            return col
+        return list(block.find_loop(label_tag))
+
+    chain_col  = _auth_or_label("_atom_site.auth_asym_id", "_atom_site.label_asym_id")
+    seq_col    = _auth_or_label("_atom_site.auth_seq_id",  "_atom_site.label_seq_id")
+    name_col   = _auth_or_label("_atom_site.auth_atom_id", "_atom_site.label_atom_id")
+    comp_col   = _auth_or_label("_atom_site.auth_comp_id", "_atom_site.label_comp_id")
     alt_col    = block.find_loop("_atom_site.label_alt_id")
     alt_list   = list(alt_col) if alt_col else [""] * n_atoms
 
