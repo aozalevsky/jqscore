@@ -26,8 +26,8 @@ XZAK_MAP = TEST_DATA / "9XZK_C15_map.mrc"
 XZAK_MAPQ_REF = TEST_DATA / "9XZK_C15__Q__mapq_s04.cif"
 
 # Docs comparison CIFs (in-repo, ~800K each)
-ORIG_CIF = DOCS_VS_MAPQ / "orig_9XZK.cif__Q__emd_72359.map.cif"
-JAX_CIF = DOCS_VS_MAPQ / "jax_9XZK.cif__Q__emd_72359.map.cif"
+ORIG_CIF = DOCS_VS_MAPQ / "9XZK.cif__Q__emd_72359.map.cif"
+JAX_CIF = DOCS_VS_MAPQ / "jax_gpu_9XZK.cif__Q__EMD-72359.map.cif"
 
 
 # ---------------------------------------------------------------------------

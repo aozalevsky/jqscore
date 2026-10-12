@@ -1,0 +1,60 @@
+# jqscore: Q-score on the GPU with JAX. The jax[cuda13] wheels bring their
+# own CUDA libraries, so the host needs only an NVIDIA driver (>= 580 for
+# CUDA 13), which apptainer passes in with --nv. Without --nv, or without a
+# GPU, JAX runs on the CPU.
+#
+# Build from the repository root (%files paths are relative to it):
+#   apptainer build --fakeroot jqscore.sif container/jqscore.def
+# For a driver older than 580, use the CUDA 12 wheels (driver >= 525):
+#   apptainer build --fakeroot --build-arg JAX="jax[cuda12]==0.9.2" jqscore.sif container/jqscore.def
+# The build ends with the test suite on the CPU (skip it with --notest).
+#
+# Run (see %help):
+#   apptainer run --nv jqscore.sif STRUCTURE MAP [options]
+#   apptainer exec --nv jqscore.sif jqscore-cmd CHIMERA map=MAP cif=CIF [cif=CIF ...] [sigma=S]
+Bootstrap: docker
+From: python:3.12-slim
+
+%arguments
+    JAX="jax[cuda13]==0.9.2"
+
+%files
+    pyproject.toml /opt/jqscore/pyproject.toml
+    README.md /opt/jqscore/README.md
+    LICENSE /opt/jqscore/LICENSE
+    jqscore /opt/jqscore/jqscore
+    tests /opt/jqscore/tests
+
+%labels
+    MAINTAINER Arthur Zalevsky <aozalevsky@gmail.com>
+
+%post
+    set -e
+    pip install --no-cache-dir --root-user-action=ignore "{{ JAX }}" "/opt/jqscore[test]"
+    find /opt/jqscore -name __pycache__ -prune -exec rm -rf {} +
+    # What the image holds, for the record
+    pip freeze > /opt/jqscore/pip-freeze.txt
+
+%test
+    cd /opt/jqscore && JAX_PLATFORMS=cpu python -m pytest -q -p no:cacheprovider tests
+
+%runscript
+    exec jqscore "$@"
+
+%help
+    jqscore: JAX-accelerated Q-score (atom-map fit of a model in a cryo-EM map).
+
+    apptainer run --nv jqscore.sif STRUCTURE MAP [--sigma S] [--output TSV] [...]
+        Q-scores of STRUCTURE (mmCIF or PDB) in MAP (MRC/CCP4); per-chain
+        and per-residue summary, or a TSV with --output. --help lists the
+        options.
+    apptainer exec --nv jqscore.sif jqscore-cmd CHIMERA map=MAP cif=CIF [cif=CIF ...] [sigma=S]
+        Drop-in for MapQ's mapq_cmd.py (as called by EMDB's VA): writes
+        CIF__Q__MAP.cif with an _atom_site.Q-score column to the working
+        directory. CHIMERA, np= and res= are accepted and ignored.
+    apptainer exec jqscore.sif compare-qscores A.cif B.cif
+        Per-atom differences of two such files.
+
+    JAX takes 75% of the GPU's memory at start; to share the GPU, run with
+    --env XLA_PYTHON_CLIENT_PREALLOCATE=false. --batch-size bounds the
+    memory of the computation itself (the map is on the GPU throughout).

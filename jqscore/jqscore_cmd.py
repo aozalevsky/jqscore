@@ -42,7 +42,7 @@ from __future__ import annotations
 import os
 import sys
 
-from jqscore.jqscore import run, write_qscore_cif
+from jqscore.jqscore import compute_qscores, read_cif, read_mrc, write_qscore_cif
 
 def _mapq_cli() -> None:
     args = sys.argv[1:]
@@ -79,10 +79,16 @@ def _mapq_cli() -> None:
 
     output_dir = os.getcwd()  # VA expects output files in the working directory
 
+    try:
+        map_data, origin, voxel_size = read_mrc(map_file)
+    except Exception as exc:
+        print(f"Q-score error reading map {map_file}: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
+
     for cif_path in cif_files:
         print(f"Q-score: processing {cif_path}", flush=True)
         try:
-            result = run(cif_path, map_file, sigma=sigma)
+            result = compute_qscores(read_cif(cif_path), map_data, origin, voxel_size, sigma=sigma)
             out_path = write_qscore_cif(result, cif_path, map_file, output_dir=output_dir)
             print(f"Q-score: wrote {out_path}", flush=True)
         except Exception as exc:

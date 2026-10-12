@@ -79,6 +79,24 @@ class TestReadMrc:
         data, _, _ = read_mrc(str(SMALL_MAP))
         assert data.max() > 0
 
+    def test_box_smaller_than_cell(self, tmp_path):
+        """Voxel size is cell / MX,MY,MZ, not cell / box size; origin from NCSTART…"""
+        nc, nr, ns = 20, 30, 40
+        arr = np.arange(nc * nr * ns, dtype=np.float32).reshape(nc, nr, ns)
+        m = gemmi.Ccp4Map()
+        m.grid = gemmi.FloatGrid(arr, gemmi.UnitCell(100, 100, 100, 90, 90, 90))
+        m.update_ccp4_header()
+        for word, value in ((8, 100), (9, 100), (10, 100), (5, 7), (6, 8), (7, 9)):
+            m.set_header_i32(word, value)
+        path = str(tmp_path / "box.map")
+        m.write_ccp4_map(path)
+
+        data, origin, voxel_size = read_mrc(path)
+        np.testing.assert_allclose(voxel_size, [1.0, 1.0, 1.0])
+        np.testing.assert_allclose(origin, [7.0, 8.0, 9.0])
+        assert data.shape == (ns, nr, nc)
+        assert data[3, 2, 1] == arr[1, 2, 3]
+
 
 # ── read_qscores (MapQ reference output, in-repo) ───────────────────────
 
@@ -105,13 +123,13 @@ class TestCompareQscores:
     def test_compare_orig_vs_jax(self):
         result = compare_qscores(str(ORIG_CIF), str(JAX_CIF))
         assert result.n_valid > 100
-        # Per-atom max diff should be < 0.02 (float32 precision)
-        assert abs(result.diff_max) < 0.02
-        assert abs(result.diff_min) < 0.02
+        # Every atom of 9XZK within 1e-3 of MapQ (max ~3e-5)
+        assert abs(result.diff_max) < 1e-3
+        assert abs(result.diff_min) < 1e-3
         # Mean diff should be near zero
-        assert abs(result.diff_mean) < 0.001
+        assert abs(result.diff_mean) < 1e-5
         # Pearson r should be very close to 1
-        assert result.pearson_r > 0.9999
+        assert result.pearson_r > 0.999999
 
     def test_self_comparison_is_perfect(self):
         result = compare_qscores(str(ORIG_CIF), str(ORIG_CIF))
@@ -184,3 +202,36 @@ class TestWriteQscoreCif:
             _, qscores_back = read_qscores(out_path)
             assert len(qscores_back) == n
             np.testing.assert_allclose(qscores_back, fake_q, atol=1e-5)
+
+    def test_trailing_ligand_rows(self, tmp_path):
+        """Q-scores go to the right rows when gemmi's atom order differs from the file's.
+
+        gemmi.read_structure() puts a ligand listed after all chains into its
+        parent chain; the CIF keeps it last.
+        """
+        tags = ("group_PDB id type_symbol label_atom_id label_alt_id label_comp_id "
+                "label_asym_id label_entity_id label_seq_id pdbx_PDB_ins_code Cartn_x "
+                "Cartn_y Cartn_z occupancy B_iso_or_equiv auth_seq_id auth_asym_id "
+                "pdbx_PDB_model_num").split()
+        rows = [
+            "ATOM 1 N N . GLY A 1 1 ? 0.000 0.000 0.000 1.00 10.0 1 A 1",
+            "ATOM 2 C CA . GLY A 1 1 ? 1.450 0.000 0.000 1.00 10.0 1 A 1",
+            "ATOM 3 N N . GLY B 1 1 ? 10.000 0.000 0.000 1.00 10.0 1 B 1",
+            "ATOM 4 C CA . GLY B 1 1 ? 11.450 0.000 0.000 1.00 10.0 1 B 1",
+            "HETATM 5 ZN ZN . ZN C 2 . ? 3.000 1.000 0.000 1.00 10.0 101 A 1",
+        ]
+        file_x = [float(r.split()[10]) for r in rows]
+        text = "data_test\nloop_\n" + "".join(f"_atom_site.{t}\n" for t in tags)
+        text += "\n".join(rows) + "\n"
+        path = tmp_path / "ligand_last.cif"
+        path.write_text(text)
+
+        atoms = read_cif(str(path))
+        assert [a.x for a in atoms] != file_x, "gemmi kept the file order"
+        # Q-score = the atom's x coordinate, so each row can be checked
+        result = QScoreResult(atoms, np.array([a.x for a in atoms]), 0.0, 1.0, 0.4)
+        out = write_qscore_cif(result, str(path), "test.map", output_dir=str(tmp_path))
+
+        block = gemmi.cif.read(out)[0]
+        written = [float(v) for v in block.find_values("_atom_site.Q-score")]
+        np.testing.assert_allclose(written, file_x)

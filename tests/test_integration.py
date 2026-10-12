@@ -400,3 +400,105 @@ class TestEndToEnd9XZKSigma04:
         cq = chain_qscores(result)
         assert "C" in cq
         assert -1.0 <= cq["C"] <= 1.0
+
+
+# ── Retry mode against a float64 reference ──────────────────────────────
+
+
+def _reference_qscores(atoms, data, origin, voxel_size, sigma=0.4, num_pts=8,
+                       max_retries=50, to_rad=2.0, d_rad=0.1):
+    """Straightforward float64 numpy Q-scores of the non-H atoms (mapq_compat=False)."""
+    from scipy.spatial import cKDTree
+    from jqscore.jqscore import _sphere_directions, min_max_d
+
+    min_d, max_d = min_max_d(data)
+    A, B = max_d - min_d, min_d
+    nz, ny, nx = data.shape
+
+    def density(pts):
+        g = (pts - origin) / voxel_size
+        i = np.floor(g).astype(int)
+        f = g - i
+        inside = ((i >= 0) & (i <= [nx - 2, ny - 2, nz - 2])).all(axis=1)
+        i = np.where(inside[:, None], i, 0)
+        out = np.zeros(len(pts))
+        for dz in (0, 1):
+            for dy in (0, 1):
+                for dx in (0, 1):
+                    w = ((f[:, 0] if dx else 1 - f[:, 0]) * (f[:, 1] if dy else 1 - f[:, 1])
+                         * (f[:, 2] if dz else 1 - f[:, 2]))
+                    out += w * data[i[:, 2] + dz, i[:, 1] + dy, i[:, 0] + dx]
+        return np.where(inside, out, 0.0)
+
+    xyz = np.array([[a.x, a.y, a.z] for a in atoms if a.element != "H"],
+                   dtype=np.float32).astype(np.float64)
+    tree = cKDTree(xyz)
+    radii = np.arange(d_rad, to_rad + 1e-6, d_rad, dtype=np.float32).astype(np.float64)
+    q = []
+    for x in xyz:
+        nbrs = xyz[tree.query_ball_point(x, 2 * to_rad)]
+        d = [density(x[None])[0]] * num_pts
+        g = [A + B] * num_pts
+        for r in radii:
+            for k in range(max_retries):
+                pts = x + _sphere_directions(num_pts + 2 * k) * r
+                dist_sq = ((pts[:, None] - nbrs[None]) ** 2).sum(-1).min(axis=1)
+                clear = dist_sq > (0.9 * r) ** 2
+                if clear.sum() >= num_pts:
+                    d += list(density(pts[clear]))
+                    g += [A * np.exp(-0.5 * (r / sigma) ** 2) + B] * int(clear.sum())
+                    break
+        d, g = np.array(d), np.array(g)
+        q.append(np.corrcoef(d, g)[0, 1] if d.std() > 0 and g.std() > 0 else 0.0)
+    return np.array(q)
+
+
+@pytest.fixture(scope="module")
+def xzak_case():
+    from jqscore.jqscore import read_cif, read_mrc
+    atoms = read_cif(str(XZAK_STRUCTURE))
+    data, origin, voxel_size = read_mrc(str(XZAK_MAP))
+    return atoms, data, origin, voxel_size
+
+
+class TestRetryModeReference:
+    """Retry mode (attempts checked in rounds) gives the retry loop's Q-scores."""
+
+    @staticmethod
+    def _heavy(result):
+        return np.array([q for a, q in zip(result.atom_records, result.atom_qscores)
+                         if a.element != "H"])
+
+    @pytest.mark.parametrize("max_retries", [50, 3, 1])
+    def test_matches_float64_reference(self, xzak_case, max_retries):
+        atoms, data, origin, voxel_size = xzak_case
+        result = compute_qscores(atoms, data, origin, voxel_size, sigma=0.4,
+                                 mapq_compat=False, max_retries=max_retries)
+        expected = _reference_qscores(atoms, data.astype(np.float64), origin, voxel_size,
+                                      max_retries=max_retries)
+        np.testing.assert_allclose(self._heavy(result), expected, atol=1e-4)
+
+    def test_translation_invariant(self, xzak_case):
+        """Moving model and map by thousands of Å changes nothing (float32 precision)."""
+        atoms, data, origin, voxel_size = xzak_case
+        shift = np.array([3011.0, 2477.0, 3893.0])
+        moved = [a._replace(x=a.x + shift[0], y=a.y + shift[1], z=a.z + shift[2]) for a in atoms]
+        here = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False)
+        there = compute_qscores(moved, data, origin + shift, voxel_size, mapq_compat=False)
+        np.testing.assert_allclose(there.atom_qscores, here.atom_qscores, atol=1e-4)
+
+    @pytest.mark.parametrize("batch_size", [32768, 64])
+    def test_round_overflow_redone(self, xzak_case, monkeypatch, batch_size):
+        """A batch with more pending pairs than a later round holds is redone, and right.
+
+        With several batches, the next is in flight when a capacity grows.
+        """
+        import jqscore.jqscore as jq
+        atoms, data, origin, voxel_size = xzak_case
+        whole = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False)
+        monkeypatch.setattr(jq, "_RETRY_CHUNK_SHARE", (0.001, 0.001, 0.001))
+        redone = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False,
+                                 batch_size=batch_size)
+        # Same points; kernels of other capacities may fuse differently, so
+        # float32 sums may round differently
+        np.testing.assert_allclose(redone.atom_qscores, whole.atom_qscores, atol=1e-6)

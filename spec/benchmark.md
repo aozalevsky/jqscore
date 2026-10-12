@@ -25,6 +25,7 @@ python -m jqscore.benchmark [OPTIONS] [PDB_IDS...]
 | `-o, --output-dir` | Root output directory                            | `jqscore_mapq_benchmark`        |
 | `--cache-dir`      | Directory for downloaded files                   | `<output-dir>/cache`             |
 | `--no-cache`       | Ignore all cached files, re-download and re-run  | `false`                          |
+| `--rerun-jqscore`  | Re-run jqscore, keep cached downloads and MapQ results (and MapQ times from `{PDB_ID}_stats.json`) | `false` |
 
 ### Environment Variables
 
@@ -91,10 +92,10 @@ All plots saved as PNG (150 dpi) in `output_dir`.
 ### 2. Summary (`summary.png`)
 
 - Only generated when >1 structure is benchmarked
-- Two-panel figure
-- **Top panel**: scatter of structure-level mean Q-scores — jqscore (Y) vs MapQ (X), with y=x reference line and PDB ID labels. Equal aspect ratio.
-- **Bottom panel**: runtime vs structure size (number of non-H atoms, sorted ascending). Three series: MapQ (np=N), jqscore (CPU), jqscore (GPU). Zero-time (cached) entries filtered out. GPU series omitted if not available. Points labeled with PDB ID.
-- Grid enabled on both panels
+- Three panels, side by side
+- **Left**: scatter of structure-level mean Q-scores — jqscore (Y) vs MapQ (X), with y=x reference line and PDB ID labels. Equal aspect ratio.
+- **Middle** (compute time) and **right** (total time, I/O + compute): runtime vs structure size (number of non-H atoms, sorted ascending), both axes logarithmic. Three series: MapQ (np=N), jqscore (CPU), jqscore (GPU). Zero-time (cached) entries filtered out. GPU series omitted if not available. Each structure labeled with its PDB ID.
+- Grid enabled on all panels
 
 ## Output Structure
 

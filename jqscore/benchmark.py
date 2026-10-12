@@ -530,14 +530,15 @@ def plot_summary(results: list[BenchmarkResult], output_dir: str) -> str:
             ax.plot(xf, yf, **kw)
 
     def _label_points(ax, x, labels, series_list):
+        """One label per structure, by its slowest point."""
         for i, lbl in enumerate(labels):
-            for y_vals, va_off in series_list:
-                if i < len(y_vals) and y_vals[i] > 0:
-                    ax.annotate(
-                        lbl, (x[i], y_vals[i]),
-                        textcoords="offset points", xytext=(5, va_off),
-                        fontsize=7, color="0.3",
-                    )
+            y = max(y_vals[i] for y_vals in series_list)
+            if y > 0:
+                ax.annotate(
+                    lbl, (x[i], y),
+                    textcoords="offset points", xytext=(5, 8),
+                    fontsize=7, color="0.3",
+                )
 
     na = [r.n_non_h for r in results_sorted]
     labels = [r.entry.pdb_id for r in results_sorted]
@@ -552,12 +553,13 @@ def plot_summary(results: list[BenchmarkResult], output_dir: str) -> str:
     if has_gpu:
         _plot_series(ax2, na, t_gpu_c, marker="D", ms=8, label="jqscore (GPU)", color="#6ACC65")
 
-    series_c = [(t_mapq, -12), (t_cpu_c, 8)]
+    series_c = [t_mapq, t_cpu_c]
     if has_gpu:
-        series_c.append((t_gpu_c, 8))
+        series_c.append(t_gpu_c)
     _label_points(ax2, na, labels, series_c)
 
     ax2.set_xscale("log")
+    ax2.set_yscale("log")
     ax2.set_xlabel("Number of non-H atoms")
     ax2.set_ylabel("Runtime (seconds)")
     ax2.set_title("Compute time")
@@ -573,12 +575,13 @@ def plot_summary(results: list[BenchmarkResult], output_dir: str) -> str:
     if has_gpu:
         _plot_series(ax3, na, t_gpu_f, marker="D", ms=8, label="jqscore (GPU)", color="#6ACC65")
 
-    series_f = [(t_mapq, -12), (t_cpu_f, 8)]
+    series_f = [t_mapq, t_cpu_f]
     if has_gpu:
-        series_f.append((t_gpu_f, 8))
+        series_f.append(t_gpu_f)
     _label_points(ax3, na, labels, series_f)
 
     ax3.set_xscale("log")
+    ax3.set_yscale("log")
     ax3.set_xlabel("Number of non-H atoms")
     ax3.set_ylabel("Runtime (seconds)")
     ax3.set_title("Total time (I/O + compute)")
@@ -837,26 +840,29 @@ def benchmark_entry(
     cache_dir: str,
     mapq_cmd_template: str,
     no_cache: bool,
+    rerun_jqscore: bool = False,
 ) -> BenchmarkResult:
     """Run full benchmark for one PDB entry."""
     pdb_id = pdb_id.upper()
 
     # Check for cached stats
-    if not no_cache:
-        cached = _load_stats(pdb_id, output_dir)
-        if cached is not None:
-            print(f"\n  Using cached stats for {pdb_id}")
-            print(f"    Pearson r:  {cached.pearson_r:.6f}")
-            print(f"    Non-H atoms: {cached.n_non_h}")
-            return cached
+    cached = None if no_cache else _load_stats(pdb_id, output_dir)
+    if cached is not None and not rerun_jqscore:
+        print(f"\n  Using cached stats for {pdb_id}")
+        print(f"    Pearson r:  {cached.pearson_r:.6f}")
+        print(f"    Non-H atoms: {cached.n_non_h}")
+        return cached
 
     entry = prepare_entry(pdb_id, cache_dir, no_cache)
 
     # Run MapQ
     mapq_cif, mapq_time = run_mapq(entry, output_dir, mapq_cmd_template, no_cache)
+    if mapq_time == 0.0 and cached is not None:
+        # MapQ output was cached: keep the time recorded when it ran
+        mapq_time = cached.mapq_time
 
     # Run jqscore (CPU + GPU)
-    jqscore_cif, jqs_times = run_jqscore(entry, output_dir, no_cache)
+    jqscore_cif, jqs_times = run_jqscore(entry, output_dir, no_cache or rerun_jqscore)
 
     # Compare
     cmp = compare_qscores(jqscore_cif, mapq_cif)
@@ -915,6 +921,10 @@ def main() -> None:
         "--no-cache", action="store_true", default=False,
         help="Ignore all cached files and re-download/re-run everything",
     )
+    parser.add_argument(
+        "--rerun-jqscore", action="store_true", default=False,
+        help="Re-run jqscore but keep cached downloads and MapQ results",
+    )
 
     args = parser.parse_args()
 
@@ -939,6 +949,7 @@ def main() -> None:
         try:
             result = benchmark_entry(
                 pdb_id, output_dir, cache_dir, mapq_cmd_template, args.no_cache,
+                args.rerun_jqscore,
             )
             results.append(result)
         except Exception as exc:

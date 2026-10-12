@@ -1,4 +1,4 @@
-"""Unit tests for data processing helpers: neighbour lists, H assignment, aggregation."""
+"""Unit tests for data processing helpers: neighbour lookup, H assignment, aggregation."""
 
 import numpy as np
 import pytest
@@ -6,7 +6,8 @@ import pytest
 from jqscore.jqscore import (
     AtomRecord,
     QScoreResult,
-    _build_neighbour_lists,
+    _NeighbourIndex,
+    _neighbour_groups,
     _assign_hydrogen_qscores,
     _resample_mapq_compat,
     residue_qscores,
@@ -14,54 +15,89 @@ from jqscore.jqscore import (
 )
 
 
-# ── _build_neighbour_lists ───────────────────────────────────────────────
+# ── _NeighbourIndex ──────────────────────────────────────────────────────
 
 
-class TestBuildNeighbourLists:
+def _neighbours(coords, radius, k=None):
+    """Neighbour indices of every atom and the mask of real (non-padding) slots."""
+    coords = np.asarray(coords, dtype=np.float32)
+    index = _NeighbourIndex(coords, radius)
+    if k is None:
+        k = int(index.counts(coords).max())
+    idx = index.query(coords, k)
+    return idx, idx < len(coords)
+
+
+class TestNeighbourIndex:
     def test_single_atom(self):
-        coords = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
-        nbr_c, nbr_v = _build_neighbour_lists(coords, radius=5.0)
-        assert nbr_c.shape[0] == 1
-        assert nbr_v.shape[0] == 1
+        idx, valid = _neighbours([[0.0, 0.0, 0.0]], radius=5.0)
+        assert idx.shape[0] == 1
         # The atom is its own neighbour
-        assert nbr_v[0, 0] == True
+        assert valid[0, 0] and idx[0, 0] == 0
 
     def test_two_close_atoms(self):
-        coords = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], dtype=np.float32)
-        nbr_c, nbr_v = _build_neighbour_lists(coords, radius=2.0)
+        idx, valid = _neighbours([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], radius=2.0)
         # Each atom should see the other as a neighbour
-        assert nbr_c.shape == (2, 2, 3)
-        assert nbr_v.shape == (2, 2)
-        assert nbr_v.all()
+        assert idx.shape == (2, 2)
+        assert valid.all()
+        assert sorted(idx[0]) == [0, 1]
 
     def test_two_distant_atoms(self):
-        coords = np.array([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]], dtype=np.float32)
-        nbr_c, nbr_v = _build_neighbour_lists(coords, radius=2.0)
+        idx, valid = _neighbours([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]], radius=2.0)
         # Each atom should only see itself
-        assert nbr_v[0].sum() == 1
-        assert nbr_v[1].sum() == 1
+        assert valid[0].sum() == 1
+        assert valid[1].sum() == 1
 
     def test_padding_shape(self):
         """All atoms padded to the same K (max neighbour count)."""
-        coords = np.array([
+        coords = [
             [0.0, 0.0, 0.0],
             [1.0, 0.0, 0.0],
             [2.0, 0.0, 0.0],
             [100.0, 0.0, 0.0],  # isolated
-        ], dtype=np.float32)
-        nbr_c, nbr_v = _build_neighbour_lists(coords, radius=1.5)
-        N, K, _ = nbr_c.shape
+        ]
+        idx, valid = _neighbours(coords, radius=1.5)
+        N, K = idx.shape
         assert N == 4
         # The middle atom (idx=1) sees all three close atoms → K ≥ 3
         assert K >= 3
-        # Isolated atom should have padding
-        assert nbr_v[3].sum() == 1
+        # Isolated atom should have padding, pointing one past the last atom
+        assert valid[3].sum() == 1
+        assert (idx[3][~valid[3]] == 4).all()
 
-    def test_dtypes(self):
-        coords = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
-        nbr_c, nbr_v = _build_neighbour_lists(coords, radius=1.0)
-        assert nbr_c.dtype == np.float32
-        assert nbr_v.dtype == np.bool_
+    def test_extra_slots_are_padding(self):
+        idx, valid = _neighbours([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]], radius=2.0, k=8)
+        assert idx.shape == (2, 8)
+        assert valid.sum(axis=1).tolist() == [2, 2]
+
+    def test_counts(self):
+        coords = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [100.0, 0.0, 0.0]], dtype=np.float32)
+        assert _NeighbourIndex(coords, 2.0).counts(coords).tolist() == [2, 2, 1]
+
+
+class TestNeighbourGroups:
+    def test_one_group_for_uniform_counts(self):
+        counts = np.array([10, 12, 13, 11] * 1000)
+        groups = _neighbour_groups(counts)
+        assert len(groups) == 1
+        members, k = groups[0]
+        assert k == 16 and len(members) == len(counts)
+
+    def test_outliers_get_own_group(self):
+        counts = np.array([12] * 100000 + [200])
+        (regular, k_regular), (many, k_many) = _neighbour_groups(counts)
+        assert k_regular == 16 and k_many == 200
+        assert many.tolist() == [100000]
+        assert len(regular) == 100000
+
+    def test_atom_at_radius_included(self):
+        """The cutoff is inclusive (as scipy's query_ball_point)."""
+        _, valid = _neighbours([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0]], radius=4.0)
+        assert valid.all()
+
+    def test_dtype(self):
+        idx, _ = _neighbours([[0.0, 0.0, 0.0]], radius=1.0)
+        assert idx.dtype == np.int32
 
 
 # ── _assign_hydrogen_qscores ────────────────────────────────────────────
@@ -86,6 +122,21 @@ class TestAssignHydrogenQscores:
 
         _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
         assert q_scores[2] == pytest.approx(0.8)  # gets CA's Q-score
+
+    def test_thiol_h_gets_sulfur_qscore(self):
+        """S-H (1.34 Å) is longer than C/N/O-H bonds."""
+        atoms = [
+            _make_atom(res_name="CYS", atom_name="CB", element="C", x=0.0, y=0.0, z=0.0),
+            _make_atom(res_name="CYS", atom_name="SG", element="S", x=1.81, y=0.0, z=0.0),
+            _make_atom(res_name="CYS", atom_name="HG", element="H", x=2.25, y=1.27, z=0.0),
+        ]
+        coords = np.array([[a.x, a.y, a.z] for a in atoms], dtype=np.float32)
+        non_h_mask = np.array([True, True, False])
+        non_h_indices = np.array([0, 1])
+        q_scores = np.array([0.8, 0.6, np.nan])
+
+        _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
+        assert q_scores[2] == pytest.approx(0.6)
 
     def test_h_too_far_stays_nan(self):
         atoms = [
@@ -224,3 +275,22 @@ class TestResampleMapqCompat:
         resampled, new_origin = _resample_mapq_compat(data, origin, voxel_size)
         assert resampled.shape == data.shape
         assert resampled.dtype == np.float32
+
+    @pytest.mark.parametrize("origin", [
+        [0.3, 0.7, 0.1],       # offsets of both signs
+        [-0.45, 0.2, -0.05],
+        [0.0, 0.5, 0.0],       # 0.5 rounds to even: offset 0 or ±0.5
+    ])
+    def test_matches_scipy_shift(self, origin):
+        """Same result as scipy.ndimage.shift(order=1, mode='constant'), edges included."""
+        from scipy.ndimage import shift
+
+        data = np.random.default_rng(1).standard_normal((7, 9, 11)).astype(np.float32)
+        origin = np.array(origin, dtype=np.float64)
+        voxel_size = np.array([1.0, 1.25, 0.8], dtype=np.float64)
+
+        resampled, new_origin = _resample_mapq_compat(data, origin, voxel_size)
+
+        offset = (new_origin - origin.astype(np.float32).astype(np.float64)) / voxel_size.astype(np.float32)
+        expected = shift(data, -offset[::-1], order=1, prefilter=False, mode="constant", cval=0.0)
+        np.testing.assert_allclose(np.asarray(resampled), expected, atol=1e-5)
