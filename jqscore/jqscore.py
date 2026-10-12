@@ -232,6 +232,145 @@ def read_cif(path: str) -> List[AtomRecord]:
     return _gemmi_model_to_atom_records(st[0])
 
 
+_UNKNOWN_SEQ = -(2 ** 62)      # residue number of a non-numeric seq_id, as one value
+
+
+class AtomSiteColumns:
+    """The ``_atom_site`` columns of a gemmi mmCIF block, each read once, when first asked for.
+
+    ``codes(*tags)``: for the first of *tags* present, its distinct values
+    (unquoted, "?" and "." kept as they are) and each row's index into them;
+    None if none is present.  ``floats(tag)``: the column as float64, or None.
+
+    :func:`block_qscores` takes any object with these two methods, so a
+    caller that reads the same columns can share them.
+    """
+
+    def __init__(self, block):
+        self.block = block
+        self._codes: dict = {}
+        self._floats: dict = {}
+
+    def _find(self, tags):
+        for tag in tags:
+            values = self.block.find_values("_atom_site." + tag)
+            if values:
+                return tag, values
+        return None, None
+
+    def codes(self, *tags):
+        tag, values = self._find(tags)
+        if tag is None:
+            return None
+        if tag not in self._codes:
+            table: dict = {}
+            code = np.fromiter((table.setdefault(v, len(table)) for v in values),
+                               dtype=np.int64, count=len(values))
+            text = [v if v in ("?", ".") else gemmi.cif.as_string(v) for v in table]
+            distinct = list(dict.fromkeys(text))        # quoted and bare spellings as one
+            index = {t: i for i, t in enumerate(distinct)}
+            self._codes[tag] = (distinct, np.array([index[t] for t in text], dtype=np.int64)[code])
+        return self._codes[tag]
+
+    def floats(self, tag):
+        if tag not in self._floats:
+            values = self.block.find_values("_atom_site." + tag)
+            self._floats[tag] = np.array(values, dtype=np.float64) if values else None
+        return self._floats[tag]
+
+
+def _atom_site_arrays(block, columns=None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """The first model's atoms of a gemmi mmCIF block, as :func:`read_cif` reads them, as arrays.
+
+    Returns ``(rows, coords, heavy, residue)``: each atom's row in the
+    ``_atom_site`` table, its position, whether it is not hydrogen, and its
+    residue code (see :func:`_residue_codes`).  The order is gemmi's: a
+    model's atoms chain by chain, chains in order of first appearance, file
+    order within a chain.  No structure or per-atom objects are built.
+    *columns*: see :class:`AtomSiteColumns`.
+    """
+    if columns is None:
+        columns = AtomSiteColumns(block)
+    x = columns.floats("Cartn_x")
+    if x is None:
+        raise ValueError("No _atom_site table")
+    rows = np.arange(len(x))
+    model = columns.codes("pdbx_PDB_model_num")
+    if model is not None:       # gemmi's first model is that of the first row
+        rows = rows[model[1] == model[1][0]]
+    if len(rows) == 0:
+        return rows, np.empty((0, 3)), np.empty(0, dtype=bool), np.empty(0, dtype=np.int64)
+
+    # Chains in order of first appearance, the file's order within each
+    chain_names, chain = columns.codes("auth_asym_id", "label_asym_id")
+    chain = np.unique(chain[rows], return_inverse=True)[1]
+    first = np.full(chain.max() + 1, len(rows))
+    np.minimum.at(first, chain, np.arange(len(rows)))
+    rank = np.argsort(np.argsort(first, kind="stable"), kind="stable")
+    order = np.argsort(rank[chain], kind="stable")
+    rows, chain = rows[order], chain[order]
+
+    coords = np.column_stack([columns.floats("Cartn_" + c)[rows] for c in "xyz"])
+
+    symbols = columns.codes("type_symbol")
+    if symbols is not None:
+        distinct, code = symbols
+        heavy = np.array([gemmi.Element(v).name.upper() != "H" for v in distinct], dtype=bool)[code[rows]]
+    else:   # (read_cif fails here) the element from the name, as for a blank type_symbol
+        distinct, code = columns.codes("label_atom_id", "auth_atom_id")
+        heavy = np.array([not v.lstrip("0123456789").upper().startswith("H") for v in distinct],
+                         dtype=bool)[code[rows]]
+
+    # Residue: chain, number, insertion code (as AtomRecord's chain_id, res_seq, ins_code)
+    distinct, code = columns.codes("auth_seq_id", "label_seq_id")
+    numbers = np.array([int(v) if v.lstrip("+-").isdigit() else _UNKNOWN_SEQ for v in distinct],
+                       dtype=np.int64)
+    _, number = np.unique(numbers[code[rows]], return_inverse=True)
+    insertion = np.zeros(len(rows), dtype=np.int64)
+    ins_values = columns.codes("pdbx_PDB_ins_code")
+    if ins_values is not None:
+        distinct, code = ins_values
+        _, ins_code = np.unique([v if v not in ("?", ".", " ", "") else "" for v in distinct],
+                                return_inverse=True)
+        insertion = ins_code[code[rows]]
+    key = (chain * (number.max() + 1) + number) * (insertion.max() + 1) + insertion
+    residue = np.unique(key, return_inverse=True)[1]
+    return rows, coords, heavy, residue
+
+
+def block_qscores(block, data: np.ndarray, origin: np.ndarray, voxel_size: np.ndarray,
+                  columns=None, **options) -> np.ndarray:
+    """Q-score of each ``_atom_site`` row of an mmCIF block read with ``gemmi.cif.read``.
+
+    The same Q-scores as ``compute_qscores(read_cif(path), …)`` for the
+    file, without building a structure: for a caller that already has the
+    file parsed, and to write the scores into the same document with
+    :func:`add_qscore_column`.  Rows of models after the first are NaN.
+    *columns*: the block's columns, if the caller has read them already
+    (see :class:`AtomSiteColumns`).  *options*: as for :func:`compute_qscores`.
+    """
+    rows, coords, heavy, residue = _atom_site_arrays(block, columns)
+    q_scores, _, _ = qscores_from_arrays(coords, heavy, residue, data, origin, voxel_size, **options)
+    by_row = np.full(len(block.find_values("_atom_site.Cartn_x")), np.nan)
+    by_row[rows] = q_scores
+    return by_row
+
+
+def add_qscore_column(block, q_scores: np.ndarray) -> None:
+    """Add an ``_atom_site.Q-score`` column to a gemmi mmCIF block, as MapQ writes it.
+
+    One value per ``_atom_site`` row, with six decimals; "?" for NaN.
+    """
+    loop = block.find_loop("_atom_site.Cartn_x").get_loop()
+    if loop.length() != len(q_scores):
+        raise ValueError(f"{len(q_scores)} Q-scores for {loop.length()} atom_site rows")
+    loop.add_columns(["_atom_site.Q-score"], "?")
+    column = block.find_values("_atom_site.Q-score")
+    for row, q in enumerate(np.asarray(q_scores, dtype=np.float64).tolist()):
+        if q == q:      # not NaN
+            column[row] = f"{q:.6f}"
+
+
 # ---------------------------------------------------------------------------
 # Core helpers
 # ---------------------------------------------------------------------------
@@ -316,18 +455,20 @@ _MAX_H_HEAVY_DIST = 1.4
 
 
 def _assign_hydrogen_qscores(
-    atoms: List[AtomRecord],
+    residue: np.ndarray,
     all_coords: np.ndarray,
     non_h_mask: np.ndarray,
     non_h_indices: np.ndarray,
     q_scores: np.ndarray,
 ) -> None:
-    """Set each hydrogen's Q-score to the Q-score of its nearest heavy atom in the same residue (in-place)."""
+    """Set each hydrogen's Q-score to the Q-score of its nearest heavy atom in the same residue (in-place).
+
+    *residue*: residue code of each atom (see :func:`_residue_codes`).
+    """
     h_indices = np.flatnonzero(~non_h_mask)
     n_heavy = len(non_h_indices)
     if len(h_indices) == 0 or n_heavy == 0:
         return
-    residue, _ = _factorize(((a.chain_id, a.res_seq, a.ins_code) for a in atoms), len(atoms))
 
     # The nearest heavy atoms within the bond cutoff, closest first; the
     # first of them in the H's residue is the residue's nearest heavy atom
@@ -352,6 +493,11 @@ def _factorize(keys, n: int) -> Tuple[np.ndarray, list]:
     table: dict = {}
     codes = np.fromiter((table.setdefault(k, len(table)) for k in keys), dtype=np.int64, count=n)
     return codes, list(table)
+
+
+def _residue_codes(atoms: List[AtomRecord]) -> np.ndarray:
+    """Residue code of each atom: equal for atoms of one residue (chain, number, insertion code)."""
+    return _factorize(((a.chain_id, a.res_seq, a.ins_code) for a in atoms), len(atoms))[0]
 
 
 def _group_means(codes: np.ndarray, values: np.ndarray, n_groups: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -1021,8 +1167,10 @@ if _HAVE_JAX:
 # Public API
 # ---------------------------------------------------------------------------
 
-def compute_qscores(
-    atoms: List[AtomRecord],
+def qscores_from_arrays(
+    coords: np.ndarray,
+    heavy: np.ndarray,
+    residue: np.ndarray,
     data: np.ndarray,
     origin: np.ndarray,
     voxel_size: np.ndarray,
@@ -1037,62 +1185,27 @@ def compute_qscores(
     mapq_compat: bool = True,
     batch_size: Optional[int] = 32768,
     verbose: bool = False,
-) -> QScoreResult:
-    """Compute per-atom Q-scores using JAX (GPU by default, CPU fallback).
+) -> Tuple[np.ndarray, float, float]:
+    """Per-atom Q-scores of atoms given as arrays.
+
+    The core of :func:`compute_qscores`, without per-atom Python objects;
+    the map and the options are as there.
 
     Parameters
     ----------
-    atoms : list of AtomRecord
-        All atoms from the parsed structure file.
-    data : ndarray, shape (nz, ny, nx)
-        Density map in ZYX order.
-    origin, voxel_size : ndarray, shape (3,)
-        Map coordinate system.
-    sigma : float
-        Gaussian width in Ångströms.  Default 0.4 Å (EMDB convention).
-        Use 0.6 for older datasets, or larger values for SSE scoring.
-    num_pts : int
-        Target sample points per shell.
-    to_rad, d_rad : float, optional
-        Radial range and step.  Defaults:
-          sigma < 1.0 → to_rad=2.0, d_rad=0.1
-          sigma ≥ 1.0 → to_rad=6.0, d_rad=0.5
-    use_retry : bool, default True
-        When True (default), replicates the original retry loop: up to
-        ``max_retries`` attempts with num_pts, num_pts+2, … sphere points,
-        until one has ≥ num_pts points clear of other atoms.
-
-        When False, uses a fixed ``n_gen`` sphere-point budget per shell,
-        at the cost of ~0.03 mean Q-score difference.
-    max_retries : int, default 50
-        Maximum retry attempts per shell (``use_retry=True`` only).
-    n_gen : int, optional
-        Fixed sphere-point budget per shell for ``use_retry=False``.
-        Default: ``max(num_pts * 16, 128)``.
-    nbr_radius : float, optional
-        Radius (Å) for the CPU neighbour search.
-        Default: ``to_rad * 2.0``.
-    mapq_compat : bool, default True
-        Resample the map to match MapQ's ``MaskMapResize`` behavior before
-        computing Q-scores.  MapQ rounds the trimmed-map origin to the nearest
-        multiple of the voxel size (using float32 arithmetic), introducing a
-        fixed fractional voxel offset that slightly blurs the map.  Enabling
-        this option replicates that effect so that Q-scores match MapQ's output
-        to within float32 rounding (~1e-4).
-
-        Set to ``False`` for the physically more accurate computation (single
-        interpolation directly from the original map).  See
-        ``docs/jqscore_vs_mapq/mapq_trimmed_map_discrepancy.md`` for details.
-    batch_size : int or None, default 32768
-        Number of atoms per batch.  Device memory per batch grows with this
-        value (the map itself is on the device throughout).  Reduce for tight
-        GPUs; ``None`` processes all atoms in a single batch.
-    verbose : bool
-        Print progress information.
+    coords : ndarray, shape (N, 3)
+        Atom positions in Ångströms.
+    heavy : ndarray of bool, shape (N,)
+        False for hydrogens.  These get the Q-score of the nearest heavy
+        atom of their residue, or NaN if there is none within 1.4 Å.
+    residue : ndarray of int, shape (N,)
+        Residue code of each atom, equal for the atoms of one residue.
 
     Returns
     -------
-    QScoreResult
+    (q_scores, min_d, max_d)
+        Q-score of each atom (float64), and the map's reference minimum and
+        maximum (see :func:`min_max_d`).
     """
     _require_jax()
     if max_retries < 1:
@@ -1125,18 +1238,17 @@ def compute_qscores(
             jdata.delete()
         jdata = resampled
 
-    non_h_mask    = np.fromiter((a.element != "H" for a in atoms), dtype=bool, count=len(atoms))
+    non_h_mask    = np.asarray(heavy, dtype=bool)
     non_h_indices = np.flatnonzero(non_h_mask)
 
     if len(non_h_indices) == 0:
         warnings.warn("No non-hydrogen atoms found.")
-        return QScoreResult(atoms, np.full(len(atoms), np.nan), min_d, max_d, sigma)
+        return np.full(len(non_h_mask), np.nan), min_d, max_d
 
     # Geometry stays in float64 on the host; the device gets each atom's
     # position in voxel units and its neighbours relative to it (float32
     # keeps those precise, unlike absolute coordinates of thousands of Å)
-    all_coords   = np.fromiter((c for a in atoms for c in (a.x, a.y, a.z)),
-                               dtype=np.float64, count=3 * len(atoms)).reshape(-1, 3)
+    all_coords   = np.asarray(coords, dtype=np.float64).reshape(-1, 3)
     non_h_coords = all_coords[non_h_mask]
     N            = len(non_h_indices)
 
@@ -1235,17 +1347,102 @@ def compute_qscores(
                     _log(f"  {done}/{N} atoms")
             previous = current
 
-    q_scores = np.full(len(atoms), np.nan, dtype=np.float64)
+    q_scores = np.full(len(non_h_mask), np.nan, dtype=np.float64)
     q_scores[non_h_indices] = q_non_h
 
     # Assign H atoms the Q-score of their nearest heavy atom in the same residue (reference behavior)
-    _assign_hydrogen_qscores(atoms, all_coords, non_h_mask, non_h_indices, q_scores)
+    _assign_hydrogen_qscores(np.asarray(residue), all_coords, non_h_mask, non_h_indices, q_scores)
     _log("Done")
+    return q_scores, min_d, max_d
+
+
+
+def compute_qscores(
+    atoms: List[AtomRecord],
+    data: np.ndarray,
+    origin: np.ndarray,
+    voxel_size: np.ndarray,
+    sigma: float = 0.4,
+    num_pts: int = 8,
+    to_rad: Optional[float] = None,
+    d_rad: Optional[float] = None,
+    use_retry: bool = True,
+    max_retries: int = 50,
+    n_gen: Optional[int] = None,
+    nbr_radius: Optional[float] = None,
+    mapq_compat: bool = True,
+    batch_size: Optional[int] = 32768,
+    verbose: bool = False,
+) -> QScoreResult:
+    """Compute per-atom Q-scores using JAX (GPU by default, CPU fallback).
+
+    Parameters
+    ----------
+    atoms : list of AtomRecord
+        All atoms from the parsed structure file.
+    data : ndarray, shape (nz, ny, nx)
+        Density map in ZYX order.
+    origin, voxel_size : ndarray, shape (3,)
+        Map coordinate system.
+    sigma : float
+        Gaussian width in Ångströms.  Default 0.4 Å (EMDB convention).
+        Use 0.6 for older datasets, or larger values for SSE scoring.
+    num_pts : int
+        Target sample points per shell.
+    to_rad, d_rad : float, optional
+        Radial range and step.  Defaults:
+          sigma < 1.0 → to_rad=2.0, d_rad=0.1
+          sigma ≥ 1.0 → to_rad=6.0, d_rad=0.5
+    use_retry : bool, default True
+        When True (default), replicates the original retry loop: up to
+        ``max_retries`` attempts with num_pts, num_pts+2, … sphere points,
+        until one has ≥ num_pts points clear of other atoms.
+
+        When False, uses a fixed ``n_gen`` sphere-point budget per shell,
+        at the cost of ~0.03 mean Q-score difference.
+    max_retries : int, default 50
+        Maximum retry attempts per shell (``use_retry=True`` only).
+    n_gen : int, optional
+        Fixed sphere-point budget per shell for ``use_retry=False``.
+        Default: ``max(num_pts * 16, 128)``.
+    nbr_radius : float, optional
+        Radius (Å) for the CPU neighbour search.
+        Default: ``to_rad * 2.0``.
+    mapq_compat : bool, default True
+        Resample the map to match MapQ's ``MaskMapResize`` behavior before
+        computing Q-scores.  MapQ rounds the trimmed-map origin to the nearest
+        multiple of the voxel size (using float32 arithmetic), introducing a
+        fixed fractional voxel offset that slightly blurs the map.  Enabling
+        this option replicates that effect so that Q-scores match MapQ's output
+        to within float32 rounding (~1e-4).
+
+        Set to ``False`` for the physically more accurate computation (single
+        interpolation directly from the original map).  See
+        ``docs/jqscore_vs_mapq/mapq_trimmed_map_discrepancy.md`` for details.
+    batch_size : int or None, default 32768
+        Number of atoms per batch.  Device memory per batch grows with this
+        value (the map itself is on the device throughout).  Reduce for tight
+        GPUs; ``None`` processes all atoms in a single batch.
+    verbose : bool
+        Print progress information.
+
+    Returns
+    -------
+    QScoreResult
+    """
+    heavy = np.fromiter((a.element != "H" for a in atoms), dtype=bool, count=len(atoms))
+    coords = np.fromiter((c for a in atoms for c in (a.x, a.y, a.z)),
+                         dtype=np.float64, count=3 * len(atoms)).reshape(-1, 3)
+    q_scores, min_d, max_d = qscores_from_arrays(
+        coords, heavy, _residue_codes(atoms), data, origin, voxel_size, sigma=sigma,
+        num_pts=num_pts, to_rad=to_rad, d_rad=d_rad, use_retry=use_retry,
+        max_retries=max_retries, n_gen=n_gen, nbr_radius=nbr_radius, mapq_compat=mapq_compat,
+        batch_size=batch_size, verbose=verbose)
 
     if verbose:
-        for k, global_idx in enumerate(non_h_indices):
-            at = atoms[global_idx]
-            print(f"  {at.res_seq}.{at.chain_id}.{at.atom_name}: Q = {q_non_h[k]:.6f}")
+        for at, q in zip(atoms, q_scores.tolist()):
+            if at.element != "H":
+                print(f"  {at.res_seq}.{at.chain_id}.{at.atom_name}: Q = {q:.6f}")
 
     return QScoreResult(atoms, q_scores, min_d, max_d, sigma)
 
@@ -1388,18 +1585,7 @@ def write_qscore_cif(
         row_of_atom[res_order] = cif_order
     q_by_row = np.empty(n_atoms, dtype=np.float64)
     q_by_row[row_of_atom] = result.atom_qscores
-
-    # Find the atom_site loop and add Q-score column
-    for item in block:
-        if item.loop and any("_atom_site" in t for t in item.loop.tags):
-            item.loop.add_columns(["_atom_site.Q-score"], "?")
-            break
-
-    qcol = block.find_values("_atom_site.Q-score")
-    for row, q in enumerate(q_by_row.tolist()):
-        if q == q:      # not NaN
-            qcol[row] = f"{q:.6f}"
-
+    add_qscore_column(block, q_by_row)
     doc.write_file(out_path)
 
     return out_path

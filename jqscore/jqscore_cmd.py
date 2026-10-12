@@ -42,7 +42,9 @@ from __future__ import annotations
 import os
 import sys
 
-from jqscore.jqscore import compute_qscores, read_cif, read_mrc, write_qscore_cif
+import gemmi
+
+from jqscore.jqscore import add_qscore_column, block_qscores, read_mrc
 
 def _mapq_cli() -> None:
     args = sys.argv[1:]
@@ -88,8 +90,15 @@ def _mapq_cli() -> None:
     for cif_path in cif_files:
         print(f"Q-score: processing {cif_path}", flush=True)
         try:
-            result = compute_qscores(read_cif(cif_path), map_data, origin, voxel_size, sigma=sigma)
-            out_path = write_qscore_cif(result, cif_path, map_file, output_dir=output_dir)
+            # One read of the file: the atoms come from the parsed document,
+            # and the Q-score column goes into it
+            doc = gemmi.cif.read(cif_path)
+            block = doc[0]
+            add_qscore_column(block, block_qscores(block, map_data, origin, voxel_size, sigma=sigma))
+            out_path = os.path.join(output_dir, f"{os.path.basename(cif_path)}__Q__"
+                                                f"{os.path.basename(map_file)}.cif")
+            doc.write_file(out_path)
+            del doc, block
             print(f"Q-score: wrote {out_path}", flush=True)
         except Exception as exc:
             # VA watches for the word "error" in stdout/stderr

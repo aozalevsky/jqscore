@@ -40,6 +40,16 @@ print(jqscore.residue_qscores(result))  # per-residue breakdown
 atoms = jqscore.read_cif("structure.cif")
 data, origin, voxel_size = jqscore.read_mrc("map.mrc")
 result = jqscore.compute_qscores(atoms, data, origin, voxel_size, sigma=0.4)
+
+# A document already parsed with gemmi (import gemmi): one Q-score per _atom_site row,
+# written back into the same document (no second read, no per-atom objects)
+doc = gemmi.cif.read("structure.cif")
+q = jqscore.block_qscores(doc[0], data, origin, voxel_size, sigma=0.4)
+jqscore.add_qscore_column(doc[0], q)
+doc.write_file("structure.cif__Q__map.mrc.cif")
+
+# Or atoms as arrays: positions, hydrogen flags and residue codes
+q, min_d, max_d = jqscore.qscores_from_arrays(coords, heavy, residue, data, origin, voxel_size)
 ```
 
 ### Computation modes
@@ -61,8 +71,9 @@ Atoms are processed in batches (`batch_size`, default 32768); the map stays on
 the GPU throughout. Lower `batch_size` if the GPU runs out of memory.
 
 On an RTX A4000, `jqscore 36ZA.cif emd_76130.map` (11.2 M atoms, 2888
-chains, 800³ map) takes 2 min, half of it reading the 1.2 GB mmCIF, and
-`jqscore-cmd` with the annotated CIF written 2.5 min.
+chains, 800³ map) takes 2 min, half of it reading the 1.2 GB mmCIF.
+`jqscore-cmd`, which reads the mmCIF once and writes the annotated copy,
+takes 1 min 40 s (14 GB peak memory).
 
 ## CLI
 

@@ -9,6 +9,7 @@ from jqscore.jqscore import (
     _NeighbourIndex,
     _neighbour_groups,
     _assign_hydrogen_qscores,
+    _residue_codes,
     _resample_mapq_compat,
     residue_qscores,
     chain_qscores,
@@ -120,7 +121,7 @@ class TestAssignHydrogenQscores:
         non_h_indices = np.array([0, 1])
         q_scores = np.array([0.8, 0.6, np.nan])
 
-        _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
+        _assign_hydrogen_qscores(_residue_codes(atoms), coords, non_h_mask, non_h_indices, q_scores)
         assert q_scores[2] == pytest.approx(0.8)  # gets CA's Q-score
 
     def test_thiol_h_gets_sulfur_qscore(self):
@@ -135,7 +136,7 @@ class TestAssignHydrogenQscores:
         non_h_indices = np.array([0, 1])
         q_scores = np.array([0.8, 0.6, np.nan])
 
-        _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
+        _assign_hydrogen_qscores(_residue_codes(atoms), coords, non_h_mask, non_h_indices, q_scores)
         assert q_scores[2] == pytest.approx(0.6)
 
     def test_h_too_far_stays_nan(self):
@@ -148,7 +149,7 @@ class TestAssignHydrogenQscores:
         non_h_indices = np.array([0])
         q_scores = np.array([0.8, np.nan])
 
-        _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
+        _assign_hydrogen_qscores(_residue_codes(atoms), coords, non_h_mask, non_h_indices, q_scores)
         assert np.isnan(q_scores[1])
 
     def test_h_uses_same_residue_only(self):
@@ -162,7 +163,7 @@ class TestAssignHydrogenQscores:
         non_h_indices = np.array([0, 1])
         q_scores = np.array([0.8, 0.3, np.nan])
 
-        _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
+        _assign_hydrogen_qscores(_residue_codes(atoms), coords, non_h_mask, non_h_indices, q_scores)
         # H at res_seq=1 should get res_seq=1 CA's score (0.8), not res_seq=2 (0.3)
         assert q_scores[2] == pytest.approx(0.8)
 
@@ -176,7 +177,7 @@ class TestAssignHydrogenQscores:
         non_h_indices = np.array([0, 1])
         q_scores = np.array([0.8, 0.6])
 
-        _assign_hydrogen_qscores(atoms, coords, non_h_mask, non_h_indices, q_scores)
+        _assign_hydrogen_qscores(_residue_codes(atoms), coords, non_h_mask, non_h_indices, q_scores)
         np.testing.assert_array_equal(q_scores, [0.8, 0.6])
 
 
