@@ -1,6 +1,7 @@
 # jqscore
 
 [![Tests](https://github.com/aozalevsky/jqscore/actions/workflows/tests.yml/badge.svg)](https://github.com/aozalevsky/jqscore/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/jqscore)](https://pypi.org/project/jqscore/)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 
 JAX reimplementation of [Q-score](https://github.com/gregdp/mapq) — a per-atom cryo-EM map-to-model fit metric.
@@ -14,15 +15,13 @@ to a theoretical Gaussian profile (Pearson correlation).
 ## Installation
 
 ```bash
-pip install git+https://github.com/aozalevsky/jqscore
+pip install jqscore            # CPU
+pip install "jqscore[gpu]"     # NVIDIA GPU: CUDA 13 build of JAX, driver ≥ 580
 ```
 
-Soon will be available for installation from PyPI:
-
-```bash
-pip install jqscore          # CPU (default JAX backend)
-pip install jqscore[gpu]     # CUDA GPU
-```
+With an older driver (≥ 525), use the CUDA 12 build of JAX:
+`pip install jqscore "jax[cuda12]"`. The development version:
+`pip install git+https://github.com/aozalevsky/jqscore`.
 
 ## Python API
 
@@ -120,7 +119,7 @@ jqscore.sif` lists the commands.
 
 ## Benchmarking against MapQ
 
-The included benchmark script downloads real PDB+EMDB structures, runs both the original [MapQ](https://github.com/gregdp/mapq) (via Singularity) and jqscore, and produces per-atom scatter plots, a summary comparison, and a markdown report.
+The included benchmark script (needs `pip install "jqscore[benchmark]"` for matplotlib) downloads real PDB+EMDB structures, runs both the original [MapQ](https://github.com/gregdp/mapq) (via Singularity) and jqscore, and produces per-atom scatter plots, a summary comparison, and a markdown report.
 
 ```bash
 # Run with default structures (7 entries):
@@ -138,7 +137,7 @@ python -m jqscore.benchmark --rerun-jqscore
 
 The MapQ reference is invoked via the `MAPQ_CMD` environment variable (expects a Singularity container by default). A full benchmark run with all 7 default structures takes approximately 30 minutes.
 
-Results are saved to `jqscore_mapq_benchmark/` (plots, output CIFs, and `README.md`); the latest run is in [`docs/jqscore_vs_mapq/`](docs/jqscore_vs_mapq/README.md). Of the 750,165 non-H atoms of its 7 entries, 15 differ from MapQ by more than 1e-3: 5 in 3J7O where the density around the atom is flat (MapQ gives ~0.1, jqscore 0), and 10 with a sample point within ~1e-7 Å of the exclusion cutoff, a tie that MapQ also breaks differently from a float64 reference in 3 of the 10. See [`spec/benchmark.md`](spec/benchmark.md) for the full specification.
+Results are saved to `jqscore_mapq_benchmark/` (plots, output CIFs, and `README.md`); the latest run is in [`docs/jqscore_vs_mapq/`](https://github.com/aozalevsky/jqscore/blob/main/docs/jqscore_vs_mapq/README.md). Of the 750,165 non-H atoms of its 7 entries, 15 differ from MapQ by more than 1e-3: 5 in 3J7O where the density around the atom is flat (MapQ gives ~0.1, jqscore 0), and 10 with a sample point within ~1e-7 Å of the exclusion cutoff, a tie that MapQ also breaks differently from a float64 reference in 3 of the 10. See [`spec/benchmark.md`](https://github.com/aozalevsky/jqscore/blob/main/spec/benchmark.md) for the full specification.
 
 ## License
 

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,7 +7,8 @@ name = "jqscore"
 version = "0.1.0"
 description = "JAX reimplementation of Q-score (github.com/gregdp/mapq)"
 readme = "README.md"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 classifiers = [
     "Programming Language :: Python :: 3.10",
@@ -27,6 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gpu = ["jax[cuda13]"]
+benchmark = ["matplotlib"]
 test = ["pytest>=7.0"]
 
 [project.scripts]
@@ -35,9 +37,9 @@ jqscore-cmd = "jqscore.jqscore_cmd:_mapq_cli"
 compare-qscores = "jqscore.compare:main"
 
 [project.urls]
-Homepage = "https://github.com/arthurb/jqscore"
-Repository = "https://github.com/arthurb/jqscore"
-Issues = "https://github.com/arthurb/jqscore/issues"
+Homepage = "https://github.com/aozalevsky/jqscore"
+Repository = "https://github.com/aozalevsky/jqscore"
+Issues = "https://github.com/aozalevsky/jqscore/issues"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

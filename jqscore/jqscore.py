@@ -410,7 +410,7 @@ def _require_jax() -> None:
         raise ImportError(
             "JAX is required.  Install with:\n"
             "  CPU only : pip install jax\n"
-            "  CUDA GPU : pip install jax[cuda12]"
+            "  CUDA GPU : pip install \"jqscore[gpu]\"  (or jax[cuda12] for NVIDIA drivers < 580)"
         )
 
 
