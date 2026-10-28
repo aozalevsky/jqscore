@@ -318,28 +318,31 @@ class TestGpuCellList:
 
         cl = _GpuCellList.build(coords, radius)
         assert cl is not None
-        assert cl.wide is wide_cluster
+        assert (cl.col_cap > 32) is wide_cluster
 
-        ref = _NeighbourIndex( cl.sorted_coords, radius)
+        ref = _NeighbourIndex(cl.sorted_coords, radius)
         ref_counts = ref.counts(cl.sorted_coords)
-        k = max(cl.k_init, int(ref_counts.max()))
-        k = max(8, -(-k // 8) * 8)
-        ref_idx = ref.query(cl.sorted_coords, k)
 
         padded = np.vstack([cl.sorted_coords, np.full((1, 3), _FAR)])
         chi = padded.astype(np.float32)
         clo = (padded - chi).astype(np.float32)
-        max_nbr, gpu_idx = cl.nbr_fn(
+        jchi, jclo = jnp.asarray(chi), jnp.asarray(clo)
+
+        gpu_counts = cl.counts(jchi, jclo)
+        np.testing.assert_array_equal(gpu_counts, ref_counts)
+
+        k = max(8, -(-int(ref_counts.max()) // 8) * 8)
+        ref_idx = ref.query(cl.sorted_coords, k)
+        gpu_idx = cl.nbr_fn(
             jnp.arange(n, dtype=jnp.int32),
             jnp.asarray(cl.sorted_cell_id),
             cl.j_cell_edge,
             cl.j_xy_offsets,
-            jnp.asarray(chi),
-            jnp.asarray(clo),
+            jchi,
+            jclo,
             cl.j_rad_sq,
             k,
         )
-        assert int(max_nbr) == int(ref_counts.max())
         gpu_idx_np = np.asarray(gpu_idx)
         for i in range(n):
             s_ref = set(ref_idx[i][ref_idx[i] < n].tolist())
