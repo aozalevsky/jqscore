@@ -71,9 +71,9 @@ Atoms are processed in batches (`batch_size`, default 32768); the map stays on
 the GPU throughout. Lower `batch_size` if the GPU runs out of memory.
 
 On an RTX A4000, `jqscore 36ZA.cif emd_76130.map` (11.2 M atoms, 2888
-chains, 800³ map) takes 2 min, half of it reading the 1.2 GB mmCIF.
+chains, 800³ map) takes 1 min 40 s, over half of it reading the 1.2 GB mmCIF.
 `jqscore-cmd`, which reads the mmCIF once and writes the annotated copy,
-takes 1 min 40 s (14 GB peak memory).
+takes 1 min 15 s (14 GB peak memory).
 
 ## CLI
 
