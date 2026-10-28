@@ -867,12 +867,9 @@ def _make_retry_fns(num_pts: int, max_retries: int):
         of the last four (B, S) — every (atom, shell) pair of the batch.
 
     ``later_rounds[i](found, n, s1, s2, atom_grid, nbr_rel, centre_vals,
-    shell_radii, map_data, voxel_size, capacity)``
-        → ``(found, n, s1, s2, n_pending)``: round i+2 for the pairs still
-        unresolved, gathered on the device in fixed-size tiles up to
-        ``min(n_pending, capacity)``.  *n_pending*: how many were unresolved
-        — if more than *capacity*, the batch's results are wrong and it must
-        be redone with a larger one.
+    shell_radii, map_data, voxel_size)``
+        → ``(found, n, s1, s2)``: round i+2 for the pairs still unresolved,
+        gathered on the device in fixed-size tiles up to ``n_pending``.
 
     ``atom_idx`` and ``nbr_idx`` index rows of ``coords_hi`` / ``coords_lo``
     (see :func:`_relative_coords`); padding slots point at a row far from
@@ -895,17 +892,17 @@ def _make_retry_fns(num_pts: int, max_retries: int):
         per_pair = vmap(shell_fn, in_axes=(0, 0, 0, 0, None, None))
 
         def later_round(found, n, s1, s2, atom_grid, nbr_rel, centre_vals,
-                        shell_radii, data, voxel_size, capacity):
+                        shell_radii, data, voxel_size):
             shape = found.shape
             n_pairs, n_shells = found.size, shape[1]
             found, n, s1, s2 = found.ravel(), n.ravel(), s1.ravel(), s2.ravel()
             pending = ~found
             n_pending = jnp.sum(pending, dtype=jnp.int32)
-            tile_size = min(capacity, tile_target)
-            n_max_tiles = -(-capacity // tile_size)
+            tile_size = min(n_pairs, tile_target)
+            n_max_tiles = -(-n_pairs // tile_size)
             (pairs,) = jnp.nonzero(pending, size=n_max_tiles * tile_size, fill_value=n_pairs)
             pairs_2d = pairs.reshape(n_max_tiles, tile_size)
-            n_tiles = (jnp.minimum(n_pending, capacity) + (tile_size - 1)) // tile_size
+            n_tiles = (n_pending + (tile_size - 1)) // tile_size
 
             def body(t, state):
                 f_arr, n_arr, s1_arr, s2_arr = state
@@ -921,8 +918,7 @@ def _make_retry_fns(num_pts: int, max_retries: int):
                 return f_arr, n_arr, s1_arr, s2_arr
 
             found, n, s1, s2 = lax.fori_loop(0, n_tiles, body, (found, n, s1, s2))
-            return (found.reshape(shape), n.reshape(shape), s1.reshape(shape),
-                    s2.reshape(shape), n_pending)
+            return found.reshape(shape), n.reshape(shape), s1.reshape(shape), s2.reshape(shape)
 
         return later_round
 
@@ -941,47 +937,22 @@ def _get_retry_fns(num_pts: int, max_retries: int):
     key = (num_pts, max_retries)
     if key not in _compiled_cache_retry:
         first_round, later_rounds = _make_retry_fns(num_pts, max_retries)
-        _compiled_cache_retry[key] = (jit(first_round),
-                                      [jit(f, static_argnums=10) for f in later_rounds])
+        _compiled_cache_retry[key] = (jit(first_round), [jit(f) for f in later_rounds])
     return _compiled_cache_retry[key]
 
 
-# Capacity of each later round, as a share of a batch's (atom, shell) pairs:
-# about 24 %, 6 % and 1 % of pairs reach rounds 2, 3 and 4 in protein models,
-# up to 29 %, 8 % and 2 % in batches of the ribosome 3J7O.  A batch with more
-# pending pairs than a capacity is redone with that capacity raised to
-# _RETRY_MARGIN times the count, for later batches too (one compilation).
-_RETRY_CHUNK_SHARE = (0.35, 0.1, 0.03)
-_RETRY_CROWDED_SHARE = (0.75, 0.5, 0.35)
-_RETRY_MARGIN = 1.5
-
-
-def _retry_chunk_size(n_pairs: int, share: float) -> int:
-    return max(256, -(-int(share * n_pairs) // 256) * 256)
-
-
 class _RetryRunner:
-    """Retry mode for the batches of one run: compiled rounds, and their capacities."""
+    """Retry mode for the batches of one run: compiled rounds for each batch shape."""
 
     def __init__(self, num_pts: int, max_retries: int, shapes, coords_hi, coords_lo,
                  shell_radii, data, voxel_size, cell_list: Optional[_GpuCellList] = None):
-        self.num_pts = num_pts
-        self.max_retries = max_retries
         self.first_round, self.later_rounds = _get_retry_fns(num_pts, max_retries)
         self.args = (coords_hi, coords_lo, shell_radii, data, voxel_size)
         self.cell_list = cell_list
         self.n_shells = shell_radii.shape[0]
-        min_k = min((k for _, k in shapes), default=0)
-        self.shares = {
-            shape: list((_RETRY_CROWDED_SHARE if shape[1] > min_k else _RETRY_CHUNK_SHARE)[:len(self.later_rounds)])
-            for shape in shapes
-        }
         self.compiled = {}
         r_list = (["nbr"] if cell_list is not None else []) + [None] + list(range(len(self.later_rounds)))
         self._compile([(shape, r) for shape in shapes for r in r_list])
-
-    def _capacity(self, shape, r: int) -> int:
-        return _retry_chunk_size(shape[0] * self.n_shells, self.shares[shape][r])
 
     def _compile(self, jobs) -> None:
         """Compile the first round (r None) and later rounds r for batch shapes, in parallel.
@@ -1011,8 +982,7 @@ class _RetryRunner:
                 exe = self.later_rounds[r].lower(
                     sds(pairs, jnp.bool_), sds(pairs, jnp.int32), sds(pairs, jnp.float32),
                     sds(pairs, jnp.float32), grid, sds((size, k, 3), jnp.float32),
-                    sds((size,), jnp.float32), shell_radii, data, voxel_size,
-                    self._capacity((size, k), r)).compile()
+                    sds((size,), jnp.float32), shell_radii, data, voxel_size).compile()
             return job, exe
 
         with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
@@ -1031,35 +1001,15 @@ class _RetryRunner:
             nbr_idx = nbr_or_cell
         nbr_rel, centre_vals, found, n, s1, s2 = self.compiled[shape, None](
             atom_idx, nbr_idx, atom_grid, *self.args)
-        n_pending = []
         for r in range(len(self.later_rounds)):
-            found, n, s1, s2, pending = self.compiled[shape, r](
+            found, n, s1, s2 = self.compiled[shape, r](
                 found, n, s1, s2, atom_grid, nbr_rel, centre_vals, shell_radii, data, voxel_size)
-            n_pending.append(pending)
-        capacities = [self._capacity(shape, r) for r in range(len(self.later_rounds))]
-        return n, s1, s2, list(zip(n_pending, capacities))
+        return n, s1, s2
 
-    def sums(self, shape, batch, launched) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """(n, s1, s2) of a launched batch, redone if a round's capacity was too small.
-
-        A count after an overflowed round includes the pairs that round left
-        out, so it bounds the count with that round complete: one redo does.
-        """
-        n, s1, s2, rounds = launched
-        n_pairs = shape[0] * self.n_shells
-        while True:
-            p_devs = tuple(p for p, _ in rounds)
-            n_host, s1_host, s2_host, p_hosts = jax.device_get((n, s1, s2, p_devs))
-            over = [(r, int(p)) for r, (p, (_, capacity)) in enumerate(zip(p_hosts, rounds))
-                    if int(p) > capacity]
-            if not over:
-                break
-            # Capacities may have grown since the launch, for a batch before
-            grow = [(r, p) for r, p in over if p > self._capacity(shape, r)]
-            for r, p in grow:
-                self.shares[shape][r] = min(1.0, _RETRY_MARGIN * p / n_pairs)
-            self._compile([(shape, r) for r, _ in grow])
-            n, s1, s2, rounds = self.launch(shape, *batch)
+    @staticmethod
+    def sums(launched) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Host (n, s1, s2) of a launched batch."""
+        n_host, s1_host, s2_host = jax.device_get(launched)
         return (np.asarray(n_host, dtype=np.float64), np.asarray(s1_host, dtype=np.float64),
                 np.asarray(s2_host, dtype=np.float64))
 
@@ -1256,6 +1206,7 @@ def _neighbour_groups(counts: np.ndarray) -> List[Tuple[np.ndarray, int]]:
 
     k_all = slots(counts.max())
     k_typical = slots(np.percentile(counts, 99.9))
+    # Below ~8M atom×slot checks (~5 ms on GPU), a second K-group costs more to compile than it saves
     if k_all <= 2 * k_typical and len(counts) * (k_all - k_typical) < 8_000_000:
         return [(np.arange(len(counts)), k_all)]
     many = counts > k_typical
@@ -1502,18 +1453,16 @@ def qscores_from_arrays(
         atom_idx = members.astype(np.int32)
         if cell_list is not None:
             nbr_or_cell = cell_list.sorted_cell_id[members]
-            if len(pos) < size:     # pad the last batch: no recompilation
-                pad = size - len(pos)
-                pos = np.concatenate([pos, np.zeros((pad, 3))])
-                nbr_or_cell = np.concatenate([nbr_or_cell, np.full(pad, cell_list.empty_cell, np.int32)])
-                atom_idx = np.concatenate([atom_idx, np.full(pad, N, np.int32)])
+            pad_nbr = cell_list.empty_cell
         else:
             nbr_or_cell = neighbours.query(pos, k)
-            if len(pos) < size:     # pad the last batch: no recompilation
-                pad = size - len(pos)
-                pos = np.concatenate([pos, np.zeros((pad, 3))])
-                nbr_or_cell = np.concatenate([nbr_or_cell, np.full((pad, k), N, np.int32)])
-                atom_idx = np.concatenate([atom_idx, np.full(pad, N, np.int32)])
+            pad_nbr = N
+        if len(pos) < size:     # pad the last batch: no recompilation
+            pad = size - len(pos)
+            pos = np.concatenate([pos, np.zeros((pad, 3))])
+            pad_shape = (pad,) + nbr_or_cell.shape[1:]
+            nbr_or_cell = np.concatenate([nbr_or_cell, np.full(pad_shape, pad_nbr, np.int32)])
+            atom_idx = np.concatenate([atom_idx, np.full(pad, N, np.int32)])
         return (size, k), (atom_idx, nbr_or_cell, ((pos - origin_np) / vs_np).astype(np.float32))
 
     def _launch(prepared):
@@ -1521,24 +1470,20 @@ def qscores_from_arrays(
         shape, arrays = prepared
         batch = tuple(jnp.asarray(a) for a in arrays)
         if use_retry:
-            pending = retry.launch(shape, *batch)
+            return retry.launch(shape, *batch)
+        if cell_list is not None:
+            nbr_idx = cell_list.nbr_fn(
+                batch[0], batch[1], cell_list.j_cell_edge, cell_list.j_xy_offsets,
+                jcoords_hi, jcoords_lo, cell_list.j_rad_sq, shape[1])
         else:
-            if cell_list is not None:
-                nbr_idx = cell_list.nbr_fn(
-                    batch[0], batch[1], cell_list.j_cell_edge, cell_list.j_xy_offsets,
-                    jcoords_hi, jcoords_lo, cell_list.j_rad_sq, shape[1])
-            else:
-                nbr_idx = batch[1]
-            nbr_rel = _relative_coords_jit(jcoords_hi, jcoords_lo, batch[0], nbr_idx)
-            pending = compute_fn(batch[2], nbr_rel, jdata, jvs, jdirs, jradii, jgv, jgv_r0)
-        return shape, batch + (pending,)
+            nbr_idx = batch[1]
+        nbr_rel = _relative_coords_jit(jcoords_hi, jcoords_lo, batch[0], nbr_idx)
+        return compute_fn(batch[2], nbr_rel, jdata, jvs, jdirs, jradii, jgv, jgv_r0)
 
     def _finish(launched) -> np.ndarray:
-        shape, batch = launched
         if use_retry:
-            n, s1, s2 = retry.sums(shape, batch[:3], batch[3])
-            return _pearson_from_shell_sums(n, s1, s2, gv_shells_np, gv_r0, num_pts)
-        return np.asarray(batch[-1], dtype=np.float64)
+            return _pearson_from_shell_sums(*retry.sums(launched), gv_shells_np, gv_r0, num_pts)
+        return np.asarray(launched, dtype=np.float64)
 
     # Pipeline: the next batch is prepared in a thread (cKDTree and numpy
     # release the GIL) and dispatched before the previous one is finished,
