@@ -47,8 +47,10 @@ Default sigma: 0.4 Å (EMDB convention). Use ``sigma=0.6`` for older datasets.
 from __future__ import annotations
 
 import heapq
+import itertools
 import time
 import warnings
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -263,19 +265,20 @@ class AtomSiteColumns:
         if tag is None:
             return None
         if tag not in self._codes:
-            table: dict = {}
-            code = np.fromiter((table.setdefault(v, len(table)) for v in values),
-                               dtype=np.int64, count=len(values))
-            text = [v if v in ("?", ".") else gemmi.cif.as_string(v) for v in table]
+            code, raw = _factorize(values, len(values))
+            text = [v if v in ("?", ".") else gemmi.cif.as_string(v) for v in raw]
             distinct = list(dict.fromkeys(text))        # quoted and bare spellings as one
-            index = {t: i for i, t in enumerate(distinct)}
-            self._codes[tag] = (distinct, np.array([index[t] for t in text], dtype=np.int64)[code])
+            if len(distinct) < len(text):
+                index = {t: i for i, t in enumerate(distinct)}
+                code = np.array([index[t] for t in text], dtype=np.int64)[code]
+            self._codes[tag] = (distinct, code)
         return self._codes[tag]
 
     def floats(self, tag):
         if tag not in self._floats:
             values = self.block.find_values("_atom_site." + tag)
-            self._floats[tag] = np.array(values, dtype=np.float64) if values else None
+            self._floats[tag] = (np.fromiter(values, dtype=np.float64, count=len(values))
+                                 if values else None)
         return self._floats[tag]
 
 
@@ -294,47 +297,52 @@ def _atom_site_arrays(block, columns=None) -> Tuple[np.ndarray, np.ndarray, np.n
     x = columns.floats("Cartn_x")
     if x is None:
         raise ValueError("No _atom_site table")
-    rows = np.arange(len(x))
+    n_total = len(x)
+    rows = np.arange(n_total)
     model = columns.codes("pdbx_PDB_model_num")
-    if model is not None:       # gemmi's first model is that of the first row
+    if model is not None and len(model[0]) > 1:     # gemmi's first model is that of the first row
         rows = rows[model[1] == model[1][0]]
     if len(rows) == 0:
         return rows, np.empty((0, 3)), np.empty(0, dtype=bool), np.empty(0, dtype=np.int64)
 
     # Chains in order of first appearance, the file's order within each
     chain_names, chain = columns.codes("auth_asym_id", "label_asym_id")
-    chain = np.unique(chain[rows], return_inverse=True)[1]
-    first = np.full(chain.max() + 1, len(rows))
-    np.minimum.at(first, chain, np.arange(len(rows)))
-    rank = np.argsort(np.argsort(first, kind="stable"), kind="stable")
-    order = np.argsort(rank[chain], kind="stable")
-    rows, chain = rows[order], chain[order]
+    if len(rows) < n_total:
+        chain = np.unique(chain[rows], return_inverse=True)[1]
+        first = np.full(chain.max() + 1, len(rows))
+        np.minimum.at(first, chain, np.arange(len(rows)))
+        rank = np.argsort(np.argsort(first, kind="stable"), kind="stable")
+        chain = rank[chain]
+    if not np.all(chain[1:] >= chain[:-1]):
+        order = np.argsort(chain, kind="stable")
+        rows, chain = rows[order], chain[order]
 
-    coords = np.column_stack([columns.floats("Cartn_" + c)[rows] for c in "xyz"])
+    idx = slice(None) if len(rows) == n_total and np.all(rows == np.arange(n_total)) else rows
+    coords = np.column_stack([columns.floats("Cartn_" + c)[idx] for c in "xyz"])
 
     symbols = columns.codes("type_symbol")
     if symbols is not None:
         distinct, code = symbols
-        heavy = np.array([gemmi.Element(v).name.upper() != "H" for v in distinct], dtype=bool)[code[rows]]
+        heavy = np.array([gemmi.Element(v).name.upper() != "H" for v in distinct], dtype=bool)[code[idx]]
     else:   # (read_cif fails here) the element from the name, as for a blank type_symbol
         distinct, code = columns.codes("label_atom_id", "auth_atom_id")
         heavy = np.array([not v.lstrip("0123456789").upper().startswith("H") for v in distinct],
-                         dtype=bool)[code[rows]]
+                         dtype=bool)[code[idx]]
 
     # Residue: chain, number, insertion code (as AtomRecord's chain_id, res_seq, ins_code)
     distinct, code = columns.codes("auth_seq_id", "label_seq_id")
     numbers = np.array([int(v) if v.lstrip("+-").isdigit() else _UNKNOWN_SEQ for v in distinct],
                        dtype=np.int64)
-    _, number = np.unique(numbers[code[rows]], return_inverse=True)
-    insertion = np.zeros(len(rows), dtype=np.int64)
+    _, num_code = np.unique(numbers, return_inverse=True)
+    number = num_code[code[idx]]
+    residue = chain * (len(num_code) + 1) + number
     ins_values = columns.codes("pdbx_PDB_ins_code")
     if ins_values is not None:
         distinct, code = ins_values
-        _, ins_code = np.unique([v if v not in ("?", ".", " ", "") else "" for v in distinct],
-                                return_inverse=True)
-        insertion = ins_code[code[rows]]
-    key = (chain * (number.max() + 1) + number) * (insertion.max() + 1) + insertion
-    residue = np.unique(key, return_inverse=True)[1]
+        ins_uniq, ins_code = np.unique([v if v not in ("?", ".", " ", "") else "" for v in distinct],
+                                       return_inverse=True)
+        if len(ins_uniq) > 1:
+            residue = residue * len(ins_uniq) + ins_code[code[idx]]
     return rows, coords, heavy, residue
 
 
@@ -490,8 +498,8 @@ def _assign_hydrogen_qscores(
 
 def _factorize(keys, n: int) -> Tuple[np.ndarray, list]:
     """Integer codes for *n* hashable keys, and the distinct keys in order of first appearance."""
-    table: dict = {}
-    codes = np.fromiter((table.setdefault(k, len(table)) for k in keys), dtype=np.int64, count=n)
+    table: dict = defaultdict(itertools.count().__next__)
+    codes = np.fromiter(map(table.__getitem__, keys), dtype=np.int64, count=n)
     return codes, list(table)
 
 
@@ -1733,7 +1741,8 @@ def write_qscore_cif(
     # needs none of the auth_*/label_* identifier columns, which differ
     # between writers (python-ihm omits auth_atom_id).
     cif_xyz = np.column_stack([
-        np.asarray(block.find_values(f"_atom_site.Cartn_{c}"), dtype=np.float64) for c in "xyz"
+        np.fromiter(block.find_values(f"_atom_site.Cartn_{c}"), dtype=np.float64, count=n_atoms)
+        for c in "xyz"
     ])
     atoms = result.atom_records
     res_xyz = np.fromiter((c for a in atoms for c in (a.x, a.y, a.z)),
