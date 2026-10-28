@@ -6,6 +6,8 @@ import pytest
 from jqscore.jqscore import (
     AtomRecord,
     QScoreResult,
+    _FAR,
+    _GpuCellList,
     _NeighbourIndex,
     _neighbour_groups,
     _assign_hydrogen_qscores,
@@ -295,3 +297,57 @@ class TestResampleMapqCompat:
         offset = (new_origin - origin.astype(np.float32).astype(np.float64)) / voxel_size.astype(np.float32)
         expected = shift(data, -offset[::-1], order=1, prefilter=False, mode="constant", cval=0.0)
         np.testing.assert_allclose(np.asarray(resampled), expected, atol=1e-5)
+
+
+# ── _GpuCellList ────────────────────────────────────────────────────────
+
+
+class TestGpuCellList:
+    @pytest.mark.parametrize("wide_cluster", [False, True])
+    def test_matches_kdtree_neighbour_sets(self, wide_cluster):
+        import jax.numpy as jnp
+
+        rng = np.random.default_rng(42)
+        coords = rng.uniform(0.0, 20.0, size=(200, 3))
+        if wide_cluster:
+            # Place 40 atoms within a single 3-cell column (32 < max_3col <= 64)
+            cluster = rng.uniform(5.0, 5.5, size=(40, 3))
+            coords = np.vstack([coords, cluster])
+        n = len(coords)
+        radius = 4.0
+
+        cl = _GpuCellList.build(coords, radius)
+        assert cl is not None
+        assert cl.wide is wide_cluster
+
+        ref = _NeighbourIndex( cl.sorted_coords, radius)
+        ref_counts = ref.counts(cl.sorted_coords)
+        k = max(cl.k_init, int(ref_counts.max()))
+        k = max(8, -(-k // 8) * 8)
+        ref_idx = ref.query(cl.sorted_coords, k)
+
+        padded = np.vstack([cl.sorted_coords, np.full((1, 3), _FAR)])
+        chi = padded.astype(np.float32)
+        clo = (padded - chi).astype(np.float32)
+        max_nbr, gpu_idx = cl.nbr_fn(
+            jnp.arange(n, dtype=jnp.int32),
+            jnp.asarray(cl.sorted_cell_id),
+            cl.j_cell_edge,
+            cl.j_xy_offsets,
+            jnp.asarray(chi),
+            jnp.asarray(clo),
+            cl.j_rad_sq,
+            k,
+        )
+        assert int(max_nbr) == int(ref_counts.max())
+        gpu_idx_np = np.asarray(gpu_idx)
+        for i in range(n):
+            s_ref = set(ref_idx[i][ref_idx[i] < n].tolist())
+            s_gpu = set(gpu_idx_np[i][gpu_idx_np[i] < n].tolist())
+            assert s_gpu == s_ref
+
+    def test_fallback_when_column_exceeds_64(self):
+        rng = np.random.default_rng(7)
+        # 70 atoms in a single cell (> 64 limit) → build returns None
+        coords = rng.uniform(1.0, 1.1, size=(70, 3))
+        assert _GpuCellList.build(coords, 4.0) is None
