@@ -664,8 +664,8 @@ def _masked_pearson(d, g, mask):
 # Compiled kernel factory — fast (fixed n_gen) mode
 # ---------------------------------------------------------------------------
 
-def _closest_dsq(offsets, nbr_rel):
-    """Squared distance from each of (P, 3) points to the closest of (K, 3) neighbours.
+def _closest_dsq(dirs, r, nbr_rel):
+    """Squared distance from each of (P, 3) points ``dirs * r`` to the closest of (K, 3) neighbours.
 
     Both are relative to the atom, so float32 keeps ~1e-7 Å even for models
     with coordinates of thousands of Å, where absolute float32 coordinates
@@ -674,15 +674,17 @@ def _closest_dsq(offsets, nbr_rel):
     A running minimum over the neighbours, in a loop: device memory and
     compile time stay independent of K and of the batch shape (a jnp.min
     reduction over K, or a fully unrolled minimum, takes minutes to compile
-    or gigabytes of temporaries for some shapes).
+    or gigabytes of temporaries for some shapes).  Multiplying ``dirs * r``
+    inside the loop body avoids materializing a ``(B, P, 3)`` offset tensor
+    in global device memory across loop iterations.
     """
     def _closer(j, min_dsq):
         nb = nbr_rel[j]
-        return jnp.minimum(min_dsq, jnp.square(offsets[:, 0] - nb[0])
-                                  + jnp.square(offsets[:, 1] - nb[1])
-                                  + jnp.square(offsets[:, 2] - nb[2]))
+        return jnp.minimum(min_dsq, jnp.square(dirs[:, 0] * r - nb[0])
+                                  + jnp.square(dirs[:, 1] * r - nb[1])
+                                  + jnp.square(dirs[:, 2] * r - nb[2]))
     return lax.fori_loop(0, nbr_rel.shape[0], _closer,
-                         jnp.full(offsets.shape[0], jnp.inf, dtype=jnp.float32),
+                         jnp.full(dirs.shape[0], jnp.inf, dtype=jnp.float32),
                          unroll=_NBR_UNROLL)
 
 
@@ -714,14 +716,13 @@ def _make_compute_fn(n_gen: int, num_pts: int):
         def _shell(_, xs):
             r, gv = xs
 
-            offsets = sphere_dirs * r
-            out_r   = r * jnp.float32(0.9)
-            sph_ok  = _closest_dsq(offsets, nbr_rel) > out_r * out_r
+            out_r  = r * jnp.float32(0.9)
+            sph_ok = _closest_dsq(sphere_dirs, r, nbr_rel) > out_r * out_r
 
             n_ok   = jnp.sum(sph_ok.astype(jnp.int32))
             sph_ok = jnp.where(n_ok >= num_pts, sph_ok, jnp.zeros_like(sph_ok))
 
-            d_vals = _trilinear_grid(data, atom_grid + offsets / voxel_size)
+            d_vals = _trilinear_grid(data, atom_grid + (sphere_dirs * r) / voxel_size)
             g_vals = jnp.full((n_gen,), gv, dtype=jnp.float32)
 
             return None, (d_vals, g_vals, sph_ok)
@@ -768,6 +769,10 @@ def _get_compute_fn(n_gen: int, num_pts: int):
 # Attempt index at which each round but the last ends; the last round runs
 # to max_retries
 _RETRY_ROUND_ENDS = (4, 12, 24)
+# Tile sizes for later rounds: active pending pairs are processed in fixed-size
+# tiles up to n_pending so unused capacity slots are skipped and per-tile
+# working sets stay small
+_RETRY_TILE_SIZES = (16384, 8192, 2048)
 
 
 class _RetryRound(NamedTuple):
@@ -822,9 +827,8 @@ def _make_shell_fn(rnd: _RetryRound, num_pts: int):
     member = jnp.asarray(member)
 
     def _shell(atom_grid, nbr_rel, centre_val, r, data, voxel_size):
-        offsets = dirs * r                                              # (P, 3)
         out_r = r * jnp.float32(0.9)
-        clear = _closest_dsq(offsets, nbr_rel) > out_r * out_r          # (P,)
+        clear = _closest_dsq(dirs, r, nbr_rel) > out_r * out_r          # (P,)
 
         # Clear points per attempt, and the first attempt with enough
         n_clear = jnp.dot(clear.astype(jnp.float32), member, precision=lax.Precision.HIGHEST)
@@ -834,7 +838,7 @@ def _make_shell_fn(rnd: _RetryRound, num_pts: int):
 
         rows = jnp.minimum(starts[k] + slots, n_dirs - 1)
         use = found & (slots < sizes[k]) & clear[rows]
-        dev = _trilinear_grid(data, atom_grid + offsets[rows] / voxel_size) - centre_val
+        dev = _trilinear_grid(data, atom_grid + (dirs[rows] * r) / voxel_size) - centre_val
         dev = jnp.where(use, dev, jnp.float32(0.0))
         return found, jnp.sum(use, dtype=jnp.int32), jnp.sum(dev), jnp.sum(dev * dev)
 
@@ -865,10 +869,10 @@ def _make_retry_fns(num_pts: int, max_retries: int):
     ``later_rounds[i](found, n, s1, s2, atom_grid, nbr_rel, centre_vals,
     shell_radii, map_data, voxel_size, capacity)``
         → ``(found, n, s1, s2, n_pending)``: round i+2 for the pairs still
-        unresolved, gathered on the device, at most *capacity* (static) of
-        them.  *n_pending*: how many were unresolved — if more than
-        *capacity*, the batch's results are wrong and it must be redone
-        with a larger one.
+        unresolved, gathered on the device in fixed-size tiles up to
+        ``min(n_pending, capacity)``.  *n_pending*: how many were unresolved
+        — if more than *capacity*, the batch's results are wrong and it must
+        be redone with a larger one.
 
     ``atom_idx`` and ``nbr_idx`` index rows of ``coords_hi`` / ``coords_lo``
     (see :func:`_relative_coords`); padding slots point at a row far from
@@ -887,7 +891,7 @@ def _make_retry_fns(num_pts: int, max_retries: int):
         return (nbr_rel, centre_vals) + per_batch(atom_grid, nbr_rel, centre_vals,
                                                   shell_radii, data, voxel_size)
 
-    def _later(shell_fn):
+    def _later(shell_fn, tile_target: int):
         per_pair = vmap(shell_fn, in_axes=(0, 0, 0, 0, None, None))
 
         def later_round(found, n, s1, s2, atom_grid, nbr_rel, centre_vals,
@@ -897,21 +901,34 @@ def _make_retry_fns(num_pts: int, max_retries: int):
             found, n, s1, s2 = found.ravel(), n.ravel(), s1.ravel(), s2.ravel()
             pending = ~found
             n_pending = jnp.sum(pending, dtype=jnp.int32)
-            (pairs,) = jnp.nonzero(pending, size=capacity, fill_value=n_pairs)
-            atom_i, shell_i = jnp.divmod(jnp.minimum(pairs, n_pairs - 1), n_shells)
-            f, nn, a, b = per_pair(atom_grid[atom_i], nbr_rel[atom_i], centre_vals[atom_i],
-                                   shell_radii[shell_i], data, voxel_size)
-            hit = jnp.where(f & (pairs < n_pairs), pairs, n_pairs)    # n_pairs: dropped
-            found = found.at[hit].set(True, mode="drop")
-            n = n.at[hit].set(nn, mode="drop")
-            s1 = s1.at[hit].set(a, mode="drop")
-            s2 = s2.at[hit].set(b, mode="drop")
+            tile_size = min(capacity, tile_target)
+            n_max_tiles = -(-capacity // tile_size)
+            (pairs,) = jnp.nonzero(pending, size=n_max_tiles * tile_size, fill_value=n_pairs)
+            pairs_2d = pairs.reshape(n_max_tiles, tile_size)
+            n_tiles = (jnp.minimum(n_pending, capacity) + (tile_size - 1)) // tile_size
+
+            def body(t, state):
+                f_arr, n_arr, s1_arr, s2_arr = state
+                p_tile = pairs_2d[t]
+                atom_i, shell_i = jnp.divmod(jnp.minimum(p_tile, n_pairs - 1), n_shells)
+                f, nn, a, b = per_pair(atom_grid[atom_i], nbr_rel[atom_i], centre_vals[atom_i],
+                                       shell_radii[shell_i], data, voxel_size)
+                hit = jnp.where(f & (p_tile < n_pairs), p_tile, n_pairs)    # n_pairs: dropped
+                f_arr = f_arr.at[hit].set(True, mode="drop")
+                n_arr = n_arr.at[hit].set(nn, mode="drop")
+                s1_arr = s1_arr.at[hit].set(a, mode="drop")
+                s2_arr = s2_arr.at[hit].set(b, mode="drop")
+                return f_arr, n_arr, s1_arr, s2_arr
+
+            found, n, s1, s2 = lax.fori_loop(0, n_tiles, body, (found, n, s1, s2))
             return (found.reshape(shape), n.reshape(shape), s1.reshape(shape),
                     s2.reshape(shape), n_pending)
 
         return later_round
 
-    return first_round, [_later(fn) for fn in shell_fns[1:]]
+    laters = [_later(fn, _RETRY_TILE_SIZES[i] if i < len(_RETRY_TILE_SIZES) else 2048)
+              for i, fn in enumerate(shell_fns[1:])]
+    return first_round, laters
 
 
 if _HAVE_JAX:
@@ -935,14 +952,12 @@ def _get_retry_fns(num_pts: int, max_retries: int):
 # pending pairs than a capacity is redone with that capacity raised to
 # _RETRY_MARGIN times the count, for later batches too (one compilation).
 _RETRY_CHUNK_SHARE = (0.35, 0.1, 0.03)
+_RETRY_CROWDED_SHARE = (0.75, 0.5, 0.35)
 _RETRY_MARGIN = 1.5
 
 
 def _retry_chunk_size(n_pairs: int, share: float) -> int:
     return max(256, -(-int(share * n_pairs) // 256) * 256)
-
-
-_executable_cache: dict = {}
 
 
 class _RetryRunner:
@@ -956,23 +971,17 @@ class _RetryRunner:
         self.args = (coords_hi, coords_lo, shell_radii, data, voxel_size)
         self.cell_list = cell_list
         self.n_shells = shell_radii.shape[0]
-        self.shares = {shape: list(_RETRY_CHUNK_SHARE[:len(self.later_rounds)]) for shape in shapes}
+        min_k = min((k for _, k in shapes), default=0)
+        self.shares = {
+            shape: list((_RETRY_CROWDED_SHARE if shape[1] > min_k else _RETRY_CHUNK_SHARE)[:len(self.later_rounds)])
+            for shape in shapes
+        }
         self.compiled = {}
         r_list = (["nbr"] if cell_list is not None else []) + [None] + list(range(len(self.later_rounds)))
         self._compile([(shape, r) for shape in shapes for r in r_list])
 
     def _capacity(self, shape, r: int) -> int:
         return _retry_chunk_size(shape[0] * self.n_shells, self.shares[shape][r])
-
-    def _cache_key(self, job):
-        (size, k), r = job
-        coords_hi, _, _, data, _ = self.args
-        cl = self.cell_list
-        if r == "nbr":
-            return ("nbr", cl.wide, size, k, coords_hi.shape[0], cl.j_cell_edge.shape[0])
-        cap = None if r is None else self._capacity((size, k), r)
-        return ("rnd", self.num_pts, self.max_retries, size, k, r, cap,
-                coords_hi.shape[0], self.n_shells, data.shape)
 
     def _compile(self, jobs) -> None:
         """Compile the first round (r None) and later rounds r for batch shapes, in parallel.
@@ -983,18 +992,8 @@ class _RetryRunner:
         if not jobs:
             return
         coords_hi, coords_lo, shell_radii, data, voxel_size = self.args
-        to_compile = []
-        for job in jobs:
-            key = self._cache_key(job)
-            if key in _executable_cache:
-                self.compiled[job] = _executable_cache[key]
-            else:
-                to_compile.append((job, key))
-        if not to_compile:
-            return
 
-        def compile_one(item):
-            job, key = item
+        def compile_one(job):
             (size, k), r = job
             sds = jax.ShapeDtypeStruct
             grid = sds((size, 3), jnp.float32)
@@ -1014,13 +1013,10 @@ class _RetryRunner:
                     sds(pairs, jnp.float32), grid, sds((size, k, 3), jnp.float32),
                     sds((size,), jnp.float32), shell_radii, data, voxel_size,
                     self._capacity((size, k), r)).compile()
-            return job, key, exe
+            return job, exe
 
-        with ThreadPoolExecutor(max_workers=min(len(to_compile), 8)) as pool:
-            for job, key, exe in pool.map(compile_one, to_compile):
-                if len(_executable_cache) >= 64:
-                    _executable_cache.clear()
-                _executable_cache[key] = exe
+        with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
+            for job, exe in pool.map(compile_one, jobs):
                 self.compiled[job] = exe
 
     def launch(self, shape, atom_idx, nbr_or_cell, atom_grid):
@@ -1028,11 +1024,11 @@ class _RetryRunner:
         coords_hi, coords_lo, shell_radii, data, voxel_size = self.args
         if self.cell_list is not None:
             cl = self.cell_list
-            max_nbr, nbr_idx = self.compiled[shape, "nbr"](
+            nbr_idx = self.compiled[shape, "nbr"](
                 atom_idx, nbr_or_cell, cl.j_cell_edge, cl.j_xy_offsets,
                 coords_hi, coords_lo, cl.j_rad_sq)
         else:
-            max_nbr, nbr_idx = None, nbr_or_cell
+            nbr_idx = nbr_or_cell
         nbr_rel, centre_vals, found, n, s1, s2 = self.compiled[shape, None](
             atom_idx, nbr_idx, atom_grid, *self.args)
         n_pending = []
@@ -1041,7 +1037,7 @@ class _RetryRunner:
                 found, n, s1, s2, atom_grid, nbr_rel, centre_vals, shell_radii, data, voxel_size)
             n_pending.append(pending)
         capacities = [self._capacity(shape, r) for r in range(len(self.later_rounds))]
-        return n, s1, s2, list(zip(n_pending, capacities)), max_nbr
+        return n, s1, s2, list(zip(n_pending, capacities))
 
     def sums(self, shape, batch, launched) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """(n, s1, s2) of a launched batch, redone if a round's capacity was too small.
@@ -1049,22 +1045,11 @@ class _RetryRunner:
         A count after an overflowed round includes the pairs that round left
         out, so it bounds the count with that round complete: one redo does.
         """
-        n, s1, s2, rounds, max_nbr = launched
+        n, s1, s2, rounds = launched
         n_pairs = shape[0] * self.n_shells
         while True:
             p_devs = tuple(p for p, _ in rounds)
-            n_host, s1_host, s2_host, p_hosts, max_nbr_host = jax.device_get(
-                (n, s1, s2, p_devs, max_nbr))
-            if max_nbr_host is not None and int(max_nbr_host) > shape[1]:
-                new_k = max(8, -(-int(max_nbr_host) // 8) * 8)
-                new_shape = (shape[0], new_k)
-                if new_shape not in self.shares:
-                    self.shares[new_shape] = list(self.shares[shape])
-                r_list = ["nbr", None] + list(range(len(self.later_rounds)))
-                self._compile([(new_shape, r) for r in r_list if (new_shape, r) not in self.compiled])
-                shape = new_shape
-                n, s1, s2, rounds, max_nbr = self.launch(shape, *batch)
-                continue
+            n_host, s1_host, s2_host, p_hosts = jax.device_get((n, s1, s2, p_devs))
             over = [(r, int(p)) for r, (p, (_, capacity)) in enumerate(zip(p_hosts, rounds))
                     if int(p) > capacity]
             if not over:
@@ -1074,7 +1059,7 @@ class _RetryRunner:
             for r, p in grow:
                 self.shares[shape][r] = min(1.0, _RETRY_MARGIN * p / n_pairs)
             self._compile([(shape, r) for r, _ in grow])
-            n, s1, s2, rounds, max_nbr = self.launch(shape, *batch)
+            n, s1, s2, rounds = self.launch(shape, *batch)
         return (np.asarray(n_host, dtype=np.float64), np.asarray(s1_host, dtype=np.float64),
                 np.asarray(s2_host, dtype=np.float64))
 
@@ -1088,16 +1073,16 @@ def _pearson_from_shell_sums(n: np.ndarray, s1: np.ndarray, s2: np.ndarray,
     are all 0.  The Gaussian is taken relative to its centre value likewise.
     """
     h = np.asarray(g_shells, dtype=np.float64) - g_r0              # (S,)
-    ones = np.ones(len(h), dtype=np.float64)
-    n = np.asarray(n, dtype=np.float64)                            # BLAS for the products
-    s1 = np.asarray(s1, dtype=np.float64)
-    s2 = np.asarray(s2, dtype=np.float64)
-    total = num_pts + (n @ ones)
-    sum_d = s1 @ ones
-    sum_h = n @ h
-    cov = (s1 @ h) - sum_d * sum_h / total
-    var_d = (s2 @ ones) - sum_d * sum_d / total
-    var_h = (n @ (h * h)) - sum_h * sum_h / total
+    m = np.column_stack([np.ones_like(h), h, h * h])               # (S, 3): 2D BLAS dgemm
+    n_m = np.asarray(n, dtype=np.float64) @ m                      # (B, 3)
+    s1_m = np.asarray(s1, dtype=np.float64) @ m[:, :2]             # (B, 2)
+    s2_m = (np.asarray(s2, dtype=np.float64) @ m[:, :1]).ravel()   # (B,)
+    total = num_pts + n_m[:, 0]
+    sum_d, s1_h = s1_m[:, 0], s1_m[:, 1]
+    sum_h, sum_hh = n_m[:, 1], n_m[:, 2]
+    cov = s1_h - sum_d * sum_h / total
+    var_d = s2_m - sum_d * sum_d / total
+    var_h = sum_hh - sum_h * sum_h / total
     denom_sq = var_d * var_h
     with np.errstate(invalid="ignore", divide="ignore"):
         q = np.where(denom_sq > 0.0, cov / np.sqrt(np.maximum(denom_sq, 1e-300)), 0.0)
@@ -1108,131 +1093,46 @@ def _pearson_from_shell_sums(n: np.ndarray, s1: np.ndarray, s2: np.ndarray,
 # Neighbour lookup (GPU 3D cell-list and CPU cKDTree)
 # ---------------------------------------------------------------------------
 
-def _ctz32(x):
-    """Count trailing zeros of a non-zero uint32 scalar via hardware clz."""
-    lsb = x & (~x + jnp.uint32(1))
-    return jnp.int32(31) - lax.clz(lsb).astype(jnp.int32)
-
-
 _gpu_nbr_fn_cache: dict = {}
 
 
-def _get_gpu_nbr_fn(wide: bool = False):
-    """Return JIT-compiled GPU 3D cell-list neighbour search kernel.
+def _get_gpu_nbr_fn(col_cap: int):
+    """Return JIT-compiled GPU 3D cell-list neighbour count and compaction kernels.
 
-    Uses scalar-register uint32 bitmasks over the 9 contiguous 3-cell Z-columns
-    around each atom's cell (up to 32 atoms per 3-cell column when ``wide=False``,
-    or up to 64 via ``(lo, hi)`` uint32 pairs when ``wide=True``).
+    Gathers up to *col_cap* candidates from each of the 9 contiguous 3-cell
+    Z-columns around an atom's cell, tests distances, and either counts hits
+    or compacts up to *k_slots* neighbour indices with ``jnp.nonzero``.
     """
-    if wide not in _gpu_nbr_fn_cache:
+    if col_cap not in _gpu_nbr_fn_cache:
+        slots = jnp.arange(col_cap, dtype=jnp.int32)[None, :]
+
+        def _hits(a_idx, cid, cell_edge, xy_offsets, coords_hi, coords_lo, radius_sq):
+            n_pad = jnp.int32(coords_hi.shape[0] - 1)
+            bases = cid + xy_offsets
+            starts = cell_edge[bases - 1][:, None]
+            ends = cell_edge[bases + 2][:, None]
+            cand = jnp.where(starts + slots < ends, starts + slots, n_pad).ravel()
+            rel = ((coords_hi[cand] - coords_hi[a_idx])
+                   + (coords_lo[cand] - coords_lo[a_idx]))
+            return cand, jnp.sum(jnp.square(rel), axis=1) <= radius_sq, n_pad
+
+        def count_nbrs(atom_idx, atom_cell, cell_edge, xy_offsets,
+                       coords_hi, coords_lo, radius_sq):
+            def count_one(a_idx, cid):
+                _, hit, _ = _hits(a_idx, cid, cell_edge, xy_offsets, coords_hi, coords_lo, radius_sq)
+                return jnp.sum(hit, dtype=jnp.int32)
+            return vmap(count_one)(atom_idx, atom_cell)
+
         def find_nbrs(atom_idx, atom_cell, cell_edge, xy_offsets,
                       coords_hi, coords_lo, radius_sq, k_slots):
-            n_pad = jnp.int32(coords_hi.shape[0] - 1)
-
             def find_one(a_idx, cid):
-                ahi0, ahi1, ahi2 = coords_hi[a_idx, 0], coords_hi[a_idx, 1], coords_hi[a_idx, 2]
-                alo0, alo1, alo2 = coords_lo[a_idx, 0], coords_lo[a_idx, 1], coords_lo[a_idx, 2]
+                cand, hit, n_pad = _hits(a_idx, cid, cell_edge, xy_offsets, coords_hi, coords_lo, radius_sq)
+                (idx,) = jnp.nonzero(hit, size=k_slots, fill_value=cand.size)
+                return jnp.where(idx < cand.size, cand[jnp.minimum(idx, cand.size - 1)], n_pad)
+            return vmap(find_one)(atom_idx, atom_cell)
 
-                if not wide:
-                    def col_mask(m):
-                        base = cid + xy_offsets[m]
-                        start = cell_edge[base - 1]
-                        end = cell_edge[base + 2]
-
-                        def check_cand(p, st):
-                            cnt, mask = st
-                            dx = (coords_hi[p, 0] - ahi0) + (coords_lo[p, 0] - alo0)
-                            dy = (coords_hi[p, 1] - ahi1) + (coords_lo[p, 1] - alo1)
-                            dz = (coords_hi[p, 2] - ahi2) + (coords_lo[p, 2] - alo2)
-                            dsq = dx * dx + dy * dy + dz * dz
-                            hit = dsq <= radius_sq
-                            bit = jnp.where(hit, jnp.uint32(1) << (p - start).astype(jnp.uint32), jnp.uint32(0))
-                            return cnt + hit.astype(jnp.int32), mask | bit
-
-                        cnt, mask = lax.fori_loop(start, end, check_cand, (jnp.int32(0), jnp.uint32(0)))
-                        return start, cnt, mask
-
-                    starts, cnts, masks = vmap(col_mask)(jnp.arange(9, dtype=jnp.int32))
-                    total_cnt = jnp.sum(cnts)
-                    s = [starts[i] for i in range(9)]
-                    b = [masks[i] for i in range(9)]
-
-                    def pop_one(carry, _):
-                        m_act = carry[8]
-                        s_act = s[8]
-                        idx = jnp.int32(8)
-                        for col in range(7, -1, -1):
-                            nz = carry[col] != jnp.uint32(0)
-                            m_act = jnp.where(nz, carry[col], m_act)
-                            s_act = jnp.where(nz, s[col], s_act)
-                            idx = jnp.where(nz, jnp.int32(col), idx)
-                        any_nz = m_act != jnp.uint32(0)
-                        bit_pos = _ctz32(m_act)
-                        p = jnp.where(any_nz, s_act + bit_pos, n_pad)
-                        cleared = m_act & (m_act - jnp.uint32(1))
-                        new_carry = tuple(jnp.where(idx == i, cleared, carry[i]) for i in range(9))
-                        return new_carry, p
-
-                    _, nbr_idx = lax.scan(pop_one, tuple(b), None, length=k_slots)
-                    return total_cnt, nbr_idx
-                else:
-                    def col_mask(m):
-                        base = cid + xy_offsets[m]
-                        start = cell_edge[base - 1]
-                        end = cell_edge[base + 2]
-
-                        def check_cand(p, st):
-                            cnt, mlo, mhi = st
-                            dx = (coords_hi[p, 0] - ahi0) + (coords_lo[p, 0] - alo0)
-                            dy = (coords_hi[p, 1] - ahi1) + (coords_lo[p, 1] - alo1)
-                            dz = (coords_hi[p, 2] - ahi2) + (coords_lo[p, 2] - alo2)
-                            dsq = dx * dx + dy * dy + dz * dz
-                            hit = dsq <= radius_sq
-                            t = (p - start).astype(jnp.uint32)
-                            bit = jnp.uint32(1) << (t & jnp.uint32(31))
-                            mlo = jnp.where(hit & (t < jnp.uint32(32)), mlo | bit, mlo)
-                            mhi = jnp.where(hit & (t >= jnp.uint32(32)), mhi | bit, mhi)
-                            return cnt + hit.astype(jnp.int32), mlo, mhi
-
-                        cnt, mlo, mhi = lax.fori_loop(
-                            start, end, check_cand, (jnp.int32(0), jnp.uint32(0), jnp.uint32(0)))
-                        return start, cnt, mlo, mhi
-
-                    starts, cnts, mlos, mhis = vmap(col_mask)(jnp.arange(9, dtype=jnp.int32))
-                    total_cnt = jnp.sum(cnts)
-                    s = [starts[i] for i in range(9)]
-                    lo = [mlos[i] for i in range(9)]
-                    hi = [mhis[i] for i in range(9)]
-
-                    def pop_one(carry, _):
-                        los, his = carry[:9], carry[9:]
-                        has_lo = [los[i] != jnp.uint32(0) for i in range(9)]
-                        bm = [jnp.where(has_lo[i], los[i], his[i]) for i in range(9)]
-                        sm = [jnp.where(has_lo[i], s[i], s[i] + jnp.int32(32)) for i in range(9)]
-                        m_act = bm[8]
-                        s_act = sm[8]
-                        idx = jnp.int32(8)
-                        for col in range(7, -1, -1):
-                            nz = bm[col] != jnp.uint32(0)
-                            m_act = jnp.where(nz, bm[col], m_act)
-                            s_act = jnp.where(nz, sm[col], s_act)
-                            idx = jnp.where(nz, jnp.int32(col), idx)
-                        any_nz = m_act != jnp.uint32(0)
-                        bit_pos = _ctz32(m_act)
-                        p = jnp.where(any_nz, s_act + bit_pos, n_pad)
-                        cleared = m_act & (m_act - jnp.uint32(1))
-                        new_los = [jnp.where((idx == i) & has_lo[i], cleared, los[i]) for i in range(9)]
-                        new_his = [jnp.where((idx == i) & (~has_lo[i]), cleared, his[i]) for i in range(9)]
-                        return tuple(new_los + new_his), p
-
-                    _, nbr_idx = lax.scan(pop_one, tuple(lo + hi), None, length=k_slots)
-                    return total_cnt, nbr_idx
-
-            cnts, nbr_idx = vmap(find_one)(atom_idx, atom_cell)
-            return jnp.max(cnts), nbr_idx
-
-        _gpu_nbr_fn_cache[wide] = jit(find_nbrs, static_argnums=(7,))
-    return _gpu_nbr_fn_cache[wide]
+        _gpu_nbr_fn_cache[col_cap] = (jit(count_nbrs), jit(find_nbrs, static_argnums=(7,)))
+    return _gpu_nbr_fn_cache[col_cap]
 
 
 class _GpuCellList:
@@ -1241,17 +1141,34 @@ class _GpuCellList:
     def __init__(self, order: np.ndarray, sorted_coords: np.ndarray,
                  sorted_cell_id: np.ndarray, cell_edge: np.ndarray,
                  xy_offsets: np.ndarray, empty_cell: int,
-                 radius: float, k_init: int, wide: bool):
+                 radius: float, col_cap: int):
         self.order = order
         self.sorted_coords = sorted_coords
         self.sorted_cell_id = sorted_cell_id
         self.empty_cell = np.int32(empty_cell)
-        self.k_init = k_init
-        self.wide = wide
-        self.nbr_fn = _get_gpu_nbr_fn(wide)
+        self.col_cap = col_cap
+        self.count_fn, self.nbr_fn = _get_gpu_nbr_fn(col_cap)
         self.j_cell_edge = jnp.asarray(cell_edge)
         self.j_xy_offsets = jnp.asarray(xy_offsets)
         self.j_rad_sq = jnp.float32(radius * radius)
+
+    def counts(self, jcoords_hi, jcoords_lo, chunk_size: int = 65536) -> np.ndarray:
+        """Exact neighbour count for each atom in ``sorted_coords``, computed on the device."""
+        n = len(self.sorted_cell_id)
+        step = min(chunk_size, n)
+        out = np.empty(n, dtype=np.int32)
+        for i in range(0, n, step):
+            m = min(step, n - i)
+            idx = np.arange(i, i + m, dtype=np.int32)
+            cid = self.sorted_cell_id[i:i + m]
+            if m < step:
+                pad = step - m
+                idx = np.concatenate([idx, np.full(pad, n, dtype=np.int32)])
+                cid = np.concatenate([cid, np.full(pad, self.empty_cell, dtype=np.int32)])
+            res = self.count_fn(jnp.asarray(idx), jnp.asarray(cid), self.j_cell_edge,
+                                self.j_xy_offsets, jcoords_hi, jcoords_lo, self.j_rad_sq)
+            out[i:i + m] = np.asarray(res)[:m]
+        return out
 
     @classmethod
     def build(cls, coords: np.ndarray, radius: float) -> Optional[_GpuCellList]:
@@ -1284,9 +1201,11 @@ class _GpuCellList:
         sorted_cell_id = cell_id[order]
         del cell_id
 
-        if n > 64 and bool(np.any(sorted_cell_id[64:] - sorted_cell_id[:-64] <= 2)):
-            return None
-        wide = bool(np.any(sorted_cell_id[32:] - sorted_cell_id[:-32] <= 2)) if n > 32 else False
+        col_cap = 8
+        while col_cap < n and bool(np.any(sorted_cell_id[col_cap:] - sorted_cell_id[:-col_cap] <= 2)):
+            col_cap += 8
+            if col_cap > 64:
+                return None
 
         counts_cell = np.bincount(sorted_cell_id, minlength=n_cells)
         cell_edge = np.empty(n_cells + 1, dtype=np.int32)
@@ -1298,35 +1217,8 @@ class _GpuCellList:
                               dtype=np.int32)
         empty_cell = (1 * ny + 1) * nz + (nz - 2)
         sorted_coords = coords[order]
-
-        # Estimate initial K from the densest occupied cells so we avoid both
-        # over-padding (e.g. K=48 when K=32 suffices) and overflow recompiles
-        is_new = np.empty(n, dtype=bool)
-        is_new[0] = True
-        is_new[1:] = sorted_cell_id[1:] != sorted_cell_id[:-1]
-        u_cells = sorted_cell_id[is_new]
-        if len(u_cells) > 512:
-            u_span = cell_edge[u_cells + 2] - cell_edge[u_cells - 1]
-            u_cells = u_cells[np.argpartition(u_span, -512)[-512:]]
-        box27_u = sum((cell_edge[u_cells + off + 2] - cell_edge[u_cells + off - 1])
-                      for off in xy_offsets)
-        n_top = min(32, len(u_cells))
-        top_u = u_cells[np.argpartition(box27_u, -n_top)[-n_top:]]
-        max_est = 0
-        r_sq = radius * radius
-        for cid in top_u:
-            pts_c = sorted_coords[cell_edge[cid]:cell_edge[cid + 1]]
-            cand = np.vstack([sorted_coords[cell_edge[cid + off - 1]:cell_edge[cid + off + 2]]
-                              for off in xy_offsets])
-            diff = pts_c[:, None, :] - cand[None, :, :]
-            cnt = int(np.sum(np.einsum("ijk,ijk->ij", diff, diff) <= r_sq, axis=1).max())
-            if cnt > max_est:
-                max_est = cnt
-        k_est = max(8, -(-int(max_est) // 8) * 8)
-        k_n = max(8, -(-int(n) // 8) * 8)
-        k_init = min(k_n, max(32, k_est))
         return cls(order, sorted_coords, sorted_cell_id, cell_edge, xy_offsets,
-                   empty_cell, radius, k_init, wide)
+                   empty_cell, radius, col_cap)
 
 class _NeighbourIndex:
     """Neighbours within *radius* of query points, among a fixed set of atoms.
@@ -1364,7 +1256,7 @@ def _neighbour_groups(counts: np.ndarray) -> List[Tuple[np.ndarray, int]]:
 
     k_all = slots(counts.max())
     k_typical = slots(np.percentile(counts, 99.9))
-    if k_all <= 2 * k_typical:
+    if k_all <= 2 * k_typical and len(counts) * (k_all - k_typical) < 8_000_000:
         return [(np.arange(len(counts)), k_all)]
     many = counts > k_typical
     return [(np.flatnonzero(~many), k_typical), (np.flatnonzero(many), k_all)]
@@ -1548,11 +1440,15 @@ def qscores_from_arrays(
     if cell_list is not None:
         neighbours = None
         work_coords = cell_list.sorted_coords
-        groups = [(np.arange(N, dtype=np.int32), cell_list.k_init)]
     else:
         neighbours = _NeighbourIndex(non_h_coords, nbr_radius)
         work_coords = non_h_coords
-        groups = _neighbour_groups(neighbours.counts(non_h_coords))
+
+    mean, std, min_val, max_val = (float(v) for v in jax.device_get(stats_dev))
+    max_d = min(mean + 10.0 * std, max_val)
+    min_d = max(mean -  1.0 * std, min_val)
+    if mapq_compat and jdata_in is not data:
+        jdata_in.delete()
 
     # Coordinates as float32 pairs (see _relative_coords); neighbour slots
     # index their rows, padding slots the last row, far from every atom
@@ -1562,11 +1458,11 @@ def qscores_from_arrays(
     jcoords_lo = jnp.asarray((padded - coords_hi).astype(np.float32))
     del padded, coords_hi
 
-    mean, std, min_val, max_val = (float(v) for v in jax.device_get(stats_dev))
-    max_d = min(mean + 10.0 * std, max_val)
-    min_d = max(mean -  1.0 * std, min_val)
-    if mapq_compat and jdata_in is not data:
-        jdata_in.delete()
+    if cell_list is not None:
+        groups = _neighbour_groups(cell_list.counts(jcoords_hi, jcoords_lo))
+    else:
+        groups = _neighbour_groups(neighbours.counts(non_h_coords))
+
     A     = float(max_d - min_d)
     B     = float(min_d)
     gv_r0 = float(A + B)
@@ -1628,13 +1524,13 @@ def qscores_from_arrays(
             pending = retry.launch(shape, *batch)
         else:
             if cell_list is not None:
-                max_nbr, nbr_idx = cell_list.nbr_fn(
+                nbr_idx = cell_list.nbr_fn(
                     batch[0], batch[1], cell_list.j_cell_edge, cell_list.j_xy_offsets,
                     jcoords_hi, jcoords_lo, cell_list.j_rad_sq, shape[1])
             else:
-                max_nbr, nbr_idx = None, batch[1]
+                nbr_idx = batch[1]
             nbr_rel = _relative_coords_jit(jcoords_hi, jcoords_lo, batch[0], nbr_idx)
-            pending = (compute_fn(batch[2], nbr_rel, jdata, jvs, jdirs, jradii, jgv, jgv_r0), max_nbr)
+            pending = compute_fn(batch[2], nbr_rel, jdata, jvs, jdirs, jradii, jgv, jgv_r0)
         return shape, batch + (pending,)
 
     def _finish(launched) -> np.ndarray:
@@ -1642,16 +1538,7 @@ def qscores_from_arrays(
         if use_retry:
             n, s1, s2 = retry.sums(shape, batch[:3], batch[3])
             return _pearson_from_shell_sums(n, s1, s2, gv_shells_np, gv_r0, num_pts)
-        q_dev, max_nbr = batch[-1]
-        k_cur = shape[1]
-        while max_nbr is not None and int(max_nbr) > k_cur:
-            k_cur = max(8, -(-int(max_nbr) // 8) * 8)
-            max_nbr, nbr_idx = cell_list.nbr_fn(
-                batch[0], batch[1], cell_list.j_cell_edge, cell_list.j_xy_offsets,
-                jcoords_hi, jcoords_lo, cell_list.j_rad_sq, k_cur)
-            nbr_rel = _relative_coords_jit(jcoords_hi, jcoords_lo, batch[0], nbr_idx)
-            q_dev = compute_fn(batch[2], nbr_rel, jdata, jvs, jdirs, jradii, jgv, jgv_r0)
-        return np.asarray(q_dev, dtype=np.float64)
+        return np.asarray(batch[-1], dtype=np.float64)
 
     # Pipeline: the next batch is prepared in a thread (cKDTree and numpy
     # release the GIL) and dispatched before the previous one is finished,
