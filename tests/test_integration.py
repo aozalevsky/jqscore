@@ -488,17 +488,15 @@ class TestRetryModeReference:
         np.testing.assert_allclose(there.atom_qscores, here.atom_qscores, atol=1e-4)
 
     @pytest.mark.parametrize("batch_size", [32768, 64])
-    def test_round_overflow_redone(self, xzak_case, monkeypatch, batch_size):
-        """A batch with more pending pairs than a later round holds is redone, and right.
-
-        With several batches, the next is in flight when a capacity grows.
-        """
+    def test_small_retry_tiles(self, xzak_case, monkeypatch, batch_size):
+        """A batch with pending pairs spanning many small tiles gives the same Q-scores."""
         import jqscore.jqscore as jq
         atoms, data, origin, voxel_size = xzak_case
         whole = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False)
-        monkeypatch.setattr(jq, "_RETRY_CHUNK_SHARE", (0.001, 0.001, 0.001))
-        redone = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False,
-                                 batch_size=batch_size)
-        # Same points; kernels of other capacities may fuse differently, so
+        monkeypatch.setattr(jq, "_RETRY_TILE_SIZES", (16, 8, 4))
+        monkeypatch.setattr(jq, "_compiled_cache_retry", {})
+        tiled = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False,
+                                batch_size=batch_size)
+        # Same points; kernels of other tile sizes may fuse differently, so
         # float32 sums may round differently
-        np.testing.assert_allclose(redone.atom_qscores, whole.atom_qscores, atol=1e-6)
+        np.testing.assert_allclose(tiled.atom_qscores, whole.atom_qscores, atol=1e-6)
