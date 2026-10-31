@@ -56,7 +56,7 @@ q, min_d, max_d = jqscore.qscores_from_arrays(coords, heavy, residue, data, orig
 
 | Mode | What it does |
 |------|--------------|
-| `use_retry=True` (default) | MapQ's retry loop: up to 50 attempts with 8, 10, 12, … sphere points per shell, until ≥ 8 are clear of other atoms. Matches a float64 reference to ~1e-5, except for about 1 atom in 100,000 with a sample point within ~1e-7 Å of the exclusion cutoff, which float32 cannot decide. |
+| `use_retry=True` (default) | MapQ's retry loop: up to 50 attempts with 8, 10, 12, … sphere points per shell, until ≥ 8 are clear of other atoms. Matches a float64 reference to ~1e-5, except for 10 of the 750,165 atoms in the benchmark with a sample point within ~1e-7 Å of the exclusion cutoff, which float32 cannot decide. |
 | `use_retry=False` | A fixed budget of `n_gen` points per shell; all clear points count. ~0.03 mean Q-score difference from retry mode. |
 
 ```python

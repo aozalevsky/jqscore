@@ -19,8 +19,8 @@ map=<path>
 cif=<path>
     Path to an mmCIF structure file.  May be repeated for multiple models.
 np=<int>
-    Number of parallel cores.  Accepted for compatibility; jqscore currently
-    runs single-threaded on the CPU (JAX handles its own parallelism).
+    Number of parallel cores.  Accepted for compatibility and ignored;
+    jqscore uses the CPUs available to the process (limit with taskset).
 res=<float>
     Map resolution in Å.  Accepted for compatibility but not used by the
     Q-score algorithm.
