@@ -182,6 +182,77 @@ class TestComputeQscoresSynthetic:
         )
 
 
+# ── Flat density and outliers ────────────────────────────────────────────
+
+
+class TestFlatDensity:
+    """Atoms in a constant region of a map with structure elsewhere (as in a masked map's
+    flat background) have zero density variance: their Q-score is exactly 0, on any
+    backend, whatever float32 rounding a weighted sum of corners would do."""
+
+    @staticmethod
+    def _map_with_flat_background():
+        background = 0.0015252422
+        shape = (30, 30, 30)
+        z, y, x = np.meshgrid(*(np.arange(n, dtype=np.float64) for n in shape), indexing="ij")
+        blob = np.exp(-((x - 5) ** 2 + (y - 5) ** 2 + (z - 5) ** 2) / (2.0 * 1.5 ** 2))
+        data = (background + blob).astype(np.float32)      # exactly constant from ~11 Å out
+        return data, np.float32(background)
+
+    @staticmethod
+    def _atoms(n=20, lo=17.0, hi=24.0, seed=0):
+        xyz = np.random.default_rng(seed).uniform(lo, hi, (n, 3))
+        return [AtomRecord("A", i + 1, "", "ALA", "CA", "C", *p) for i, p in enumerate(xyz)]
+
+    def test_flat_background_gives_zero(self):
+        data, background = self._map_with_flat_background()
+        assert np.all(data[13:, 13:, 13:] == background)
+        result = compute_qscores(self._atoms(), data, np.zeros(3), np.ones(3),
+                                 sigma=0.4, mapq_compat=False)
+        assert np.all(result.atom_qscores == 0.0)
+
+    def test_flat_background_off_grid_origin_gives_zero(self):
+        """The same with an origin off the voxel grid, so that mapq_compat resamples the map."""
+        data, _ = self._map_with_flat_background()
+        origin = np.array([0.37, 0.61, 0.23])
+        result = compute_qscores(self._atoms(), data, origin, np.ones(3), sigma=0.4)
+        assert np.all(result.atom_qscores == 0.0)
+
+    @pytest.mark.parametrize("mapq_compat", [False, True])
+    def test_one_ulp_texture_shift_invariant(self, mapq_compat):
+        """Q-scores of a background with a one-ULP texture do not change when the whole map is
+        shifted by a constant that float32 adds exactly (values stay in [1, 2)).  A weighted
+        sum of absolute corner values rounds differently at the two levels (0.3.0: up to 0.5)."""
+        shape = (30, 30, 30)
+        z, y, x = np.meshgrid(*(np.arange(n, dtype=np.float64) for n in shape), indexing="ij")
+        blob = 0.25 * np.exp(-((x - 5) ** 2 + (y - 5) ** 2 + (z - 5) ** 2) / (2.0 * 1.5 ** 2))
+        data = (1.25 + blob).astype(np.float32)
+        rng = np.random.default_rng(0)
+        texture = rng.random(shape) < 0.5
+        data[texture] = np.nextafter(data[texture], np.float32(2))
+        shifted = data + np.float32(0.25)
+        assert np.all(shifted - np.float32(0.25) == data) and shifted.max() < 2
+        origin = np.array([0.37, 0.61, 0.23]) if mapq_compat else np.zeros(3)
+        atoms = self._atoms(seed=1)
+        q = compute_qscores(atoms, data, origin, np.ones(3), sigma=0.4,
+                            mapq_compat=mapq_compat).atom_qscores
+        q_shifted = compute_qscores(atoms, shifted, origin, np.ones(3), sigma=0.4,
+                                    mapq_compat=mapq_compat).atom_qscores
+        assert np.abs(q).max() > 0.1
+        np.testing.assert_allclose(q_shifted, q, atol=1e-6)
+
+    def test_far_outlier_voxel_changes_nothing(self):
+        """One extreme voxel far from the atoms leaves their Q-scores unchanged."""
+        centre = [10.0, 10.0, 10.0]
+        data, origin, voxel_size = TestComputeQscoresSynthetic._make_gaussian_map(centre)
+        atoms = [AtomRecord("A", i, "", "ALA", "CA", "C", 9.0 + i * 0.5, 10.2, 9.7) for i in range(5)]
+        q = compute_qscores(atoms, data, origin, voxel_size, sigma=0.4).atom_qscores
+        data[0, 0, 19] = 1e35
+        q_outlier = compute_qscores(atoms, data, origin, voxel_size, sigma=0.4).atom_qscores
+        assert np.all(np.abs(q) > 0.1)
+        np.testing.assert_allclose(q_outlier, q, atol=1e-6)
+
+
 # ── End-to-end on 390_7cec_A100 (in-repo, 100 atoms, sigma=0.6) ────────
 
 

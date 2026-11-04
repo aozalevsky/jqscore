@@ -7,7 +7,9 @@ import jax.numpy as jnp
 
 from jqscore.jqscore import (
     _sphere_directions,
+    _shift_linear,
     _trilinear,
+    _trilinear_split,
     _masked_pearson,
     min_max_d,
 )
@@ -181,6 +183,54 @@ class TestTrilinear:
         expected = np.array([0.0, 1.0, 10.0, 100.0])
         result = _trilinear(jdata, jorigin, jvs, pts)
         np.testing.assert_allclose(result, expected, atol=1e-4)
+
+
+# ── _trilinear_split ─────────────────────────────────────────────────────
+
+
+class TestTrilinearSplit:
+    def test_constant_region_is_exact(self):
+        """On a constant map the offset from the nearest corner is exactly 0 at any point."""
+        c = np.float32(0.0015252422)
+        data = jnp.full((6, 6, 6), c, dtype=jnp.float32)
+        pts = jnp.asarray(np.random.default_rng(0).uniform(0.0, 4.999, (1000, 3)), dtype=jnp.float32)
+        r, delta = _trilinear_split(data, pts)
+        assert np.all(np.asarray(r) == c)
+        assert np.all(np.asarray(delta) == 0.0)
+
+    def test_sum_is_trilinear(self, ramp_map):
+        data, _, _ = ramp_map
+        pts = jnp.asarray(np.random.default_rng(1).uniform(0.0, 3.999, (200, 3)), dtype=jnp.float32)
+        r, delta = _trilinear_split(jnp.array(data), pts)
+        g = np.asarray(pts, dtype=np.float64)
+        expected = g[:, 0] + 10.0 * g[:, 1] + 100.0 * g[:, 2]     # the ramp is linear
+        np.testing.assert_allclose(np.asarray(r) + np.asarray(delta), expected, atol=1e-4)
+
+    def test_far_hot_corner_enters_with_its_weight(self):
+        """A large value at the far corner of the cell does not swamp the interpolated value."""
+        data = np.zeros((4, 4, 4), dtype=np.float32)
+        data[1, 1, 1] = 10.0
+        f = 0.9999
+        r, delta = _trilinear_split(jnp.array(data), jnp.array([[1 + f, 1 + f, 1 + f]], dtype=jnp.float32))
+        fx = float(np.float32(1 + f)) - 1.0                        # the fraction as float32 sees it
+        assert float(r[0]) == 0.0
+        np.testing.assert_allclose(float(delta[0]), 10.0 * (1 - fx) ** 3, rtol=1e-3)
+
+    def test_outside_map_is_zero(self, ramp_map):
+        data, _, _ = ramp_map
+        r, delta = _trilinear_split(jnp.array(data), jnp.array([[-0.5, 1.0, 1.0], [1.0, 4.5, 1.0]]))
+        assert np.all(np.asarray(r) == 0.0) and np.all(np.asarray(delta) == 0.0)
+
+
+# ── _shift_linear ────────────────────────────────────────────────────────
+
+
+class TestShiftLinear:
+    def test_constant_stays_constant(self):
+        """A constant map stays exactly constant after the fractional shift (edges aside)."""
+        c = np.float32(0.0015252422)
+        out = np.asarray(_shift_linear(jnp.full((8, 8, 8), c, dtype=jnp.float32), (0.37, -0.61, 0.23)))
+        assert np.all(out[1:-1, 1:-1, 1:-1] == c)
 
 
 # ── _masked_pearson ──────────────────────────────────────────────────────

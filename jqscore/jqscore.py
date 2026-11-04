@@ -595,8 +595,18 @@ def _trilinear(data, origin, voxel_size, pts):
     return _trilinear_grid(data, (pts - origin) / voxel_size)
 
 
-def _trilinear_grid(data, grid_pts):
-    """Trilinear map interpolation at (N, 3) points in voxel units (x, y, z) from the origin."""
+def _trilinear_split(data, grid_pts):
+    """Trilinear map interpolation at (N, 3) points in voxel units (x, y, z) from the origin,
+    as ``(r, delta)``: *r* is the map value at the corner of the point's cell nearest to it
+    and *delta* the interpolated value minus *r*; both 0 for points outside the map.
+
+    The corners are taken relative to the nearest one before they are weighted, so the
+    float32 rounding acts on the density's variation within the cell rather than on its
+    absolute value: on a constant region *delta* is exactly 0 whatever the point and
+    backend (a weighted sum of absolute values is off by a few ULPs that depend on both),
+    and a large value at a far corner enters only with its small weight.  Differences of
+    two points' densities are best formed as ``(r1 - r2) + (delta1 - delta2)``.
+    """
     nz, ny, nx = data.shape
 
     gx = grid_pts[:, 0]
@@ -621,17 +631,41 @@ def _trilinear_grid(data, grid_pts):
     cy = jnp.clip(iy, 0, ny - 2)
     cz = jnp.clip(iz, 0, nz - 2)
 
-    v = (
-        data[cz,     cy,     cx    ] * (1 - fx) * (1 - fy) * (1 - fz)
-      + data[cz,     cy,     cx + 1] *      fx  * (1 - fy) * (1 - fz)
-      + data[cz,     cy + 1, cx    ] * (1 - fx) *      fy  * (1 - fz)
-      + data[cz,     cy + 1, cx + 1] *      fx  *      fy  * (1 - fz)
-      + data[cz + 1, cy,     cx    ] * (1 - fx) * (1 - fy) *      fz
-      + data[cz + 1, cy,     cx + 1] *      fx  * (1 - fy) *      fz
-      + data[cz + 1, cy + 1, cx    ] * (1 - fx) *      fy  *      fz
-      + data[cz + 1, cy + 1, cx + 1] *      fx  *      fy  *      fz
+    # Corners c[z][y][x] of the cell
+    c000 = data[cz,     cy,     cx    ]
+    c001 = data[cz,     cy,     cx + 1]
+    c010 = data[cz,     cy + 1, cx    ]
+    c011 = data[cz,     cy + 1, cx + 1]
+    c100 = data[cz + 1, cy,     cx    ]
+    c101 = data[cz + 1, cy,     cx + 1]
+    c110 = data[cz + 1, cy + 1, cx    ]
+    c111 = data[cz + 1, cy + 1, cx + 1]
+
+    # The nearest corner
+    hx, hy, hz = fx >= 0.5, fy >= 0.5, fz >= 0.5
+    r = jnp.where(hz,
+                  jnp.where(hy, jnp.where(hx, c111, c110), jnp.where(hx, c101, c100)),
+                  jnp.where(hy, jnp.where(hx, c011, c010), jnp.where(hx, c001, c000)))
+
+    delta = (
+        (c000 - r) * (1 - fx) * (1 - fy) * (1 - fz)
+      + (c001 - r) *      fx  * (1 - fy) * (1 - fz)
+      + (c010 - r) * (1 - fx) *      fy  * (1 - fz)
+      + (c011 - r) *      fx  *      fy  * (1 - fz)
+      + (c100 - r) * (1 - fx) * (1 - fy) *      fz
+      + (c101 - r) *      fx  * (1 - fy) *      fz
+      + (c110 - r) * (1 - fx) *      fy  *      fz
+      + (c111 - r) *      fx  *      fy  *      fz
     )
-    return jnp.where(inside, v, 0.0)
+    zero = jnp.float32(0.0)
+    return jnp.where(inside, r, zero), jnp.where(inside, delta, zero)
+
+
+def _trilinear_grid(data, grid_pts):
+    """Trilinear map interpolation at (N, 3) points in voxel units (x, y, z) from the origin;
+    0 for points outside the map.  See :func:`_trilinear_split`."""
+    r, delta = _trilinear_split(data, grid_pts)
+    return r + delta
 
 
 def _masked_pearson(d, g, mask):
@@ -716,8 +750,11 @@ def _make_compute_fn(n_gen: int, num_pts: int):
     def _qscore_one(atom_grid, nbr_rel, data, voxel_size,
                     sphere_dirs, shell_radii, gv_shells, gv_r0):
 
-        val_r0  = _trilinear_grid(data, atom_grid[None, :])[0]
-        d_r0    = jnp.full((n_gen,), val_r0, dtype=jnp.float32)
+        # Densities relative to the centre's (Pearson r is unchanged by the shift), formed
+        # from each point's nearest corner and offset (see _trilinear_split)
+        r_c, delta_c = _trilinear_split(data, atom_grid[None, :])
+        r_c, delta_c = r_c[0], delta_c[0]
+        d_r0    = jnp.zeros((n_gen,), dtype=jnp.float32)
         g_r0    = jnp.full((n_gen,), gv_r0, dtype=jnp.float32)
         mask_r0 = jnp.ones((n_gen,), dtype=jnp.bool_)
 
@@ -730,7 +767,8 @@ def _make_compute_fn(n_gen: int, num_pts: int):
             n_ok   = jnp.sum(sph_ok.astype(jnp.int32))
             sph_ok = jnp.where(n_ok >= num_pts, sph_ok, jnp.zeros_like(sph_ok))
 
-            d_vals = _trilinear_grid(data, atom_grid + (sphere_dirs * r) / voxel_size)
+            r_p, delta_p = _trilinear_split(data, atom_grid + (sphere_dirs * r) / voxel_size)
+            d_vals = (r_p - r_c) + (delta_p - delta_c)
             g_vals = jnp.full((n_gen,), gv, dtype=jnp.float32)
 
             return None, (d_vals, g_vals, sph_ok)
@@ -805,19 +843,27 @@ def _retry_rounds(num_pts: int, max_retries: int) -> List[_RetryRound]:
     return rounds
 
 
+# Density deviations below this (in the map's units) are 0: their squares
+# would be float32 denormals, which XLA flushes to 0 on the CPU but keeps on
+# the GPU, so the two would differ in near-zero density (e.g. at the edge of
+# a masked map, where values of 1e-30 and less occur)
+_DEV_FLOOR = 2.0 ** -63
+
+
 def _make_shell_fn(rnd: _RetryRound, num_pts: int):
     """Build the per-(atom, shell) function for one round of attempts.
 
     Signature
     ---------
-    fn(atom_grid (3,), nbr_rel (K, 3), centre_val, r, map_data, voxel_size)
+    fn(atom_grid (3,), nbr_rel (K, 3), centre_val (2,), r, map_data, voxel_size)
     → (found, n, s1, s2)
 
     *atom_grid*: the atom's position in voxel units from the map origin;
     *nbr_rel*: neighbour positions relative to the atom, in Å.
+    *centre_val*: the centre's ``(r, delta)`` from :func:`_trilinear_split`.
     *found*: whether an attempt of this round has ≥ num_pts clear points.
     For the first such attempt, *n* is its number of clear points and *s1*,
-    *s2* are the sum and sum of squares of (density − centre_val) over them;
+    *s2* are the sum and sum of squares of (density − centre density) over them;
     all three are 0 when nothing was found.
     """
     dirs    = jnp.asarray(rnd.dirs)
@@ -846,8 +892,9 @@ def _make_shell_fn(rnd: _RetryRound, num_pts: int):
 
         rows = jnp.minimum(starts[k] + slots, n_dirs - 1)
         use = found & (slots < sizes[k]) & clear[rows]
-        dev = _trilinear_grid(data, atom_grid + (dirs[rows] * r) / voxel_size) - centre_val
-        dev = jnp.where(use, dev, jnp.float32(0.0))
+        r_p, delta_p = _trilinear_split(data, atom_grid + (dirs[rows] * r) / voxel_size)
+        dev = (r_p - centre_val[0]) + (delta_p - centre_val[1])
+        dev = jnp.where(use & (jnp.abs(dev) >= _DEV_FLOOR), dev, jnp.float32(0.0))
         return found, jnp.sum(use, dtype=jnp.int32), jnp.sum(dev), jnp.sum(dev * dev)
 
     return _shell
@@ -871,7 +918,7 @@ def _make_retry_fns(num_pts: int, max_retries: int):
 
     ``first_round(atom_idx (B,), nbr_idx (B, K), atom_grid (B, 3),
     coords_hi, coords_lo, shell_radii (S,), map_data, voxel_size)``
-        → ``(nbr_rel (B, K, 3), centre_vals (B,), found, n, s1, s2)``, each
+        → ``(nbr_rel (B, K, 3), centre_vals (B, 2), found, n, s1, s2)``, each
         of the last four (B, S) — every (atom, shell) pair of the batch.
 
     ``later_rounds[i](found, n, s1, s2, atom_grid, nbr_rel, centre_vals,
@@ -892,7 +939,7 @@ def _make_retry_fns(num_pts: int, max_retries: int):
     def first_round(atom_idx, nbr_idx, atom_grid, coords_hi, coords_lo,
                     shell_radii, data, voxel_size):
         nbr_rel = _relative_coords(coords_hi, coords_lo, atom_idx, nbr_idx)
-        centre_vals = _trilinear_grid(data, atom_grid)
+        centre_vals = jnp.stack(_trilinear_split(data, atom_grid), axis=-1)
         return (nbr_rel, centre_vals) + per_batch(atom_grid, nbr_rel, centre_vals,
                                                   shell_radii, data, voxel_size)
 
@@ -990,7 +1037,7 @@ class _RetryRunner:
                 exe = self.later_rounds[r].lower(
                     sds(pairs, jnp.bool_), sds(pairs, jnp.int32), sds(pairs, jnp.float32),
                     sds(pairs, jnp.float32), grid, sds((size, k, 3), jnp.float32),
-                    sds((size,), jnp.float32), shell_radii, data, voxel_size).compile()
+                    sds((size, 2), jnp.float32), shell_radii, data, voxel_size).compile()
             return job, exe
 
         with ThreadPoolExecutor(max_workers=min(len(jobs), 8)) as pool:
@@ -1286,10 +1333,13 @@ def _shift_linear(data, offsets):
         lo = lax.slice_in_dim(data, 0, n - 1, axis=axis)
         hi = lax.slice_in_dim(data, 1, n, axis=axis)
         edge = jnp.zeros_like(lax.slice_in_dim(data, 0, 1, axis=axis))
+        # lo + t*(hi - lo): exact where hi == lo, so a constant region stays constant
+        # whether or not the backend fuses the multiply-add (a weighted sum of lo and hi
+        # is off by an ULP that depends on it)
         if off > 0:     # between i and i+1; the last voxel's source is past the end
-            data = jnp.concatenate([(1.0 - off) * lo + off * hi, edge], axis=axis)
+            data = jnp.concatenate([lo + off * (hi - lo), edge], axis=axis)
         else:           # between i-1 and i; the first voxel's source is before the start
-            data = jnp.concatenate([edge, -off * lo + (1.0 + off) * hi], axis=axis)
+            data = jnp.concatenate([edge, hi + off * (hi - lo)], axis=axis)
     return data
 
 
