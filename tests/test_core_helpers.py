@@ -97,6 +97,20 @@ class TestMinMaxD:
         _, max_d = min_max_d(data)
         assert max_d <= 1.0
 
+    @pytest.mark.parametrize("scale", [1e-25, 1e-20, 1e20, 1e35])
+    def test_extreme_scales_no_overflow_or_underflow(self, scale):
+        base = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float64).reshape(1, 1, 5)
+        data = (base * scale).astype(np.float32)
+        min_d, max_d = min_max_d(data)
+        assert np.isfinite(min_d) and np.isfinite(max_d)
+        assert max_d > min_d
+        assert min_d == pytest.approx(max(3.0 - np.std([1, 2, 3, 4, 5]), 1.0) * scale, rel=1e-4)
+        assert max_d == pytest.approx(5.0 * scale, rel=1e-4)
+
+    def test_empty_raises(self):
+        with pytest.raises(ValueError, match="Empty"):
+            min_max_d(np.empty((0, 0, 0), dtype=np.float32))
+
 
 # ── _trilinear ───────────────────────────────────────────────────────────
 
@@ -221,6 +235,11 @@ class TestTrilinearSplit:
         r, delta = _trilinear_split(jnp.array(data), jnp.array([[-0.5, 1.0, 1.0], [1.0, 4.5, 1.0]]))
         assert np.all(np.asarray(r) == 0.0) and np.all(np.asarray(delta) == 0.0)
 
+    def test_nan_coords_return_zero(self, ramp_map):
+        data, _, _ = ramp_map
+        r, delta = _trilinear_split(jnp.array(data), jnp.array([[np.nan, 1.0, 1.0]], dtype=jnp.float32))
+        assert float(r[0]) == 0.0 and float(delta[0]) == 0.0
+
 
 # ── _shift_linear ────────────────────────────────────────────────────────
 
@@ -231,6 +250,19 @@ class TestShiftLinear:
         c = np.float32(0.0015252422)
         out = np.asarray(_shift_linear(jnp.full((8, 8, 8), c, dtype=jnp.float32), (0.37, -0.61, 0.23)))
         assert np.all(out[1:-1, 1:-1, 1:-1] == c)
+
+    def test_zero_offset_returns_same_array(self):
+        arr = jnp.ones((6, 6, 6), dtype=jnp.float32)
+        out = _shift_linear(arr, (0.0, 0.0, 0.0))
+        assert out is arr
+
+    def test_same_sign_offsets_reuse_jit_entry(self):
+        from jqscore.jqscore import _shift_linear_jit
+        arr = jnp.ones((6, 6, 6), dtype=jnp.float32)
+        _shift_linear(arr, (0.11, -0.22, 0.33))
+        n_before = _shift_linear_jit._cache_size()
+        _shift_linear(arr, (0.41, -0.17, 0.09))
+        assert _shift_linear_jit._cache_size() == n_before
 
 
 # ── _masked_pearson ──────────────────────────────────────────────────────
@@ -289,3 +321,9 @@ class TestMaskedPearson:
         expected = float(np.corrcoef(d_np, g_np)[0, 1])
         result = float(_masked_pearson(jnp.array(d_np), jnp.array(g_np), mask))
         assert result == pytest.approx(expected, abs=1e-4)
+
+    def test_small_scale_not_shrunk(self):
+        d = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=jnp.float32) * jnp.float32(1e-10)
+        g = jnp.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=jnp.float32) * jnp.float32(1e-10)
+        mask = jnp.ones(5, dtype=jnp.bool_)
+        assert float(_masked_pearson(d, g, mask)) == pytest.approx(1.0, abs=1e-5)

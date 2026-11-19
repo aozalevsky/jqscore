@@ -52,12 +52,12 @@ def _mapq_cli() -> None:
         print(__doc__)
         sys.exit(1)
 
-    # First positional arg is chimera_root — accepted but ignored.
-    # Remaining args are key=value pairs.
+    # Optional bare positional args (such as chimera_root) are accepted and ignored.
+    # Remaining args are key=value pairs in any order.
     cif_files: list[str] = []
     params: dict[str, str] = {}
 
-    for arg in args[1:]:
+    for arg in args:
         if "=" in arg:
             key, _, val = arg.partition("=")
             key_lc = key.strip().lower()
@@ -65,7 +65,7 @@ def _mapq_cli() -> None:
                 cif_files.append(val.strip())
             else:
                 params[key_lc] = val.strip()
-        # bare positional args after chimera_root are silently ignored
+        # bare positional args (e.g. chimera_root) are silently ignored
 
     map_file = params.get("map")
     if not map_file:
@@ -76,7 +76,11 @@ def _mapq_cli() -> None:
         print("Error: at least one cif= argument is required", file=sys.stderr)
         sys.exit(1)
 
-    sigma = float(params.get("sigma", 0.4))
+    try:
+        sigma = float(params.get("sigma", 0.4))
+    except ValueError as exc:
+        print(f"Q-score error parsing sigma: {exc}", file=sys.stderr, flush=True)
+        sys.exit(1)
     # np= and res= are accepted for compatibility; jqscore ignores them.
 
     output_dir = os.getcwd()  # VA expects output files in the working directory

@@ -199,9 +199,16 @@ class TestWriteQscoreCif:
 
             out_path = write_qscore_cif(result, no_auth_cif, "test.map", output_dir=tmpdir)
 
-            _, qscores_back = read_qscores(out_path)
+            struct, qscores_back = read_qscores(out_path)
             assert len(qscores_back) == n
+            assert len(struct.atom_name) == n
             np.testing.assert_allclose(qscores_back, fake_q, atol=1e-5)
+
+            # compare_qscores must also work when auth_atom_id is absent
+            cmp = compare_qscores(out_path, out_path)
+            assert cmp.n_valid == n
+            assert len(cmp.atom_labels) == n
+            assert cmp.diff_max == pytest.approx(0.0)
 
     def test_trailing_ligand_rows(self, tmp_path):
         """Q-scores go to the right rows when gemmi's atom order differs from the file's.
@@ -235,3 +242,122 @@ class TestWriteQscoreCif:
         block = gemmi.cif.read(out)[0]
         written = [float(v) for v in block.find_values("_atom_site.Q-score")]
         np.testing.assert_allclose(written, file_x)
+
+    def test_coincident_coords_reordered_not_swapped(self, tmp_path):
+        """Atoms at identical coordinates across chains must not have Q-scores swapped."""
+        tags = ("group_PDB id type_symbol label_atom_id label_alt_id label_comp_id "
+                "label_asym_id label_entity_id label_seq_id Cartn_x Cartn_y Cartn_z "
+                "auth_seq_id auth_asym_id pdbx_PDB_model_num").split()
+        rows = [
+            "ATOM 1 N N . GLY A 1 1 0.000 0.000 0.000 1 A 1",
+            "ATOM 2 N N . GLY B 1 1 3.000 1.000 0.000 1 B 1",
+            "HETATM 3 ZN ZN . ZN C 2 . 3.000 1.000 0.000 101 A 1",
+        ]
+        path = tmp_path / "coincident.cif"
+        path.write_text("data_test\nloop_\n" + "".join(f"_atom_site.{t}\n" for t in tags)
+                        + "\n".join(rows) + "\n")
+        atoms = read_cif(str(path))
+        # gemmi order: A/N, A/ZN, B/N
+        assert [(a.chain_id, a.atom_name) for a in atoms] == [("A", "N"), ("A", "ZN"), ("B", "N")]
+        result = QScoreResult(atoms, np.array([0.1, 0.9, 0.2]), 0.0, 1.0, 0.4)
+        out = write_qscore_cif(result, str(path), "test.map", output_dir=str(tmp_path))
+
+        block = gemmi.cif.read(out)[0]
+        written = [float(v) for v in block.find_values("_atom_site.Q-score")]
+        # File order: A/N (0.1), B/N (0.2), A/ZN (0.9)
+        np.testing.assert_allclose(written, [0.1, 0.2, 0.9])
+
+    def test_split_residue_coincident_coords(self, tmp_path):
+        """Non-contiguous rows of one residue with coincident coords match by full identity."""
+        tags = ("group_PDB id type_symbol label_atom_id label_alt_id label_comp_id "
+                "label_asym_id label_entity_id label_seq_id Cartn_x Cartn_y Cartn_z "
+                "auth_seq_id auth_asym_id pdbx_PDB_model_num").split()
+        rows = [
+            "ATOM 1 C CA . ALA A 1 1 0.000 0.000 0.000 1 A 1",
+            "ATOM 2 C CA . VAL A 1 2 2.000 0.000 0.000 2 A 1",
+            "ATOM 3 C CB . ALA A 1 1 2.000 0.000 0.000 1 A 1",
+        ]
+        path = tmp_path / "split_res.cif"
+        path.write_text("data_test\nloop_\n" + "".join(f"_atom_site.{t}\n" for t in tags)
+                        + "\n".join(rows) + "\n")
+        atoms = read_cif(str(path))
+        # gemmi groups ALA/1 CA and CB before VAL/2 CA
+        assert [(a.res_name, a.atom_name) for a in atoms] == [("ALA", "CA"), ("ALA", "CB"), ("VAL", "CA")]
+        result = QScoreResult(atoms, np.array([0.1, 0.8, 0.3]), 0.0, 1.0, 0.4)
+        out = write_qscore_cif(result, str(path), "test.map", output_dir=str(tmp_path))
+
+        block = gemmi.cif.read(out)[0]
+        written = [float(v) for v in block.find_values("_atom_site.Q-score")]
+        # File order: ALA CA (0.1), VAL CA (0.3), ALA CB (0.8)
+        np.testing.assert_allclose(written, [0.1, 0.3, 0.8])
+
+    def test_multimodel_cif(self, tmp_path):
+        """write_qscore_cif writes first-model Q-scores and '?' for later models."""
+        tags = ("group_PDB id type_symbol label_atom_id label_alt_id label_comp_id "
+                "label_asym_id label_entity_id label_seq_id Cartn_x Cartn_y Cartn_z "
+                "auth_seq_id auth_asym_id pdbx_PDB_model_num").split()
+        rows = [
+            "ATOM 1 C CA . ALA A 1 1 1.000 2.000 3.000 1 A 1",
+            "ATOM 2 C CA . ALA A 1 1 4.000 5.000 6.000 1 A 2",
+        ]
+        path = tmp_path / "multimodel.cif"
+        path.write_text("data_mm\nloop_\n" + "".join(f"_atom_site.{t}\n" for t in tags)
+                        + "\n".join(rows) + "\n")
+        atoms = read_cif(str(path))
+        assert len(atoms) == 1
+        result = QScoreResult(atoms, np.array([0.75]), 0.0, 1.0, 0.4)
+        out = write_qscore_cif(result, str(path), "test.map", output_dir=str(tmp_path))
+
+        _, q_back = read_qscores(out)
+        assert len(q_back) == 2
+        assert q_back[0] == pytest.approx(0.75)
+        assert np.isnan(q_back[1])
+
+    def test_esd_coordinates(self, tmp_path):
+        """CIFs with standard-uncertainty parenthesized coordinates round-trip cleanly."""
+        tags = ("group_PDB id type_symbol label_atom_id label_alt_id label_comp_id "
+                "label_asym_id label_entity_id label_seq_id Cartn_x Cartn_y Cartn_z").split()
+        rows = ["ATOM 1 C CA . ALA A 1 1 1.234(5) 2.000(1) 3.000"]
+        path = tmp_path / "esd.cif"
+        path.write_text("data_esd\nloop_\n" + "".join(f"_atom_site.{t}\n" for t in tags)
+                        + "\n".join(rows) + "\n")
+        atoms = read_cif(str(path))
+        result = QScoreResult(atoms, np.array([0.42]), 0.0, 1.0, 0.4)
+        out = write_qscore_cif(result, str(path), "test.map", output_dir=str(tmp_path))
+
+        _, q_back = read_qscores(out)
+        np.testing.assert_allclose(q_back, [0.42], atol=1e-5)
+
+    def test_read_mrc_zero_cell_raises(self, tmp_path):
+        arr = np.ones((4, 4, 4), dtype=np.float32)
+        m = gemmi.Ccp4Map()
+        m.grid = gemmi.FloatGrid(arr, gemmi.UnitCell(0, 0, 0, 90, 90, 90))
+        m.update_ccp4_header()
+        path = str(tmp_path / "zero_cell.mrc")
+        m.write_ccp4_map(path)
+        with pytest.raises(ValueError, match="voxel size"):
+            read_mrc(path)
+
+    def test_read_cif_empty_raises(self, tmp_path):
+        path = tmp_path / "empty.cif"
+        path.write_text("data_empty\n")
+        with pytest.raises(ValueError, match="No models"):
+            read_cif(str(path))
+
+    def test_jqscore_cmd_optional_chimera_root(self, tmp_path, monkeypatch):
+        """jqscore-cmd works both with and without the optional chimera_root positional arg."""
+        import sys
+        from jqscore.jqscore_cmd import _mapq_cli
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(sys, "argv", [
+            "jqscore-cmd",
+            f"map={SMALL_MAP}",
+            f"cif={SMALL_STRUCTURE}",
+            "sigma=0.4",
+        ])
+        _mapq_cli()
+        out = tmp_path / f"{SMALL_STRUCTURE.name}__Q__{SMALL_MAP.name}.cif"
+        assert out.exists()
+        _, q_back = read_qscores(str(out))
+        assert len(q_back) == 100

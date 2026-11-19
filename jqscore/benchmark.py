@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+import gemmi
 import matplotlib
 
 matplotlib.use("Agg")
@@ -302,11 +303,18 @@ def _run_jqscore_subprocess(
         output_dir, f"{prefix}{entry.pdb_id}.cif__Q__{map_basename}.cif"
     )
 
-    # Inline script: warmup JIT, then time full run and compute separately
+    # Inline script: initialize JAX backend, then time full run and compute separately
+    # (note: compute_elapsed still includes XLA compilation for the entry's batch shapes)
+    check_gpu = (
+        "import jax; "
+        "assert jax.default_backend() == 'gpu', f'expected gpu backend, got {jax.default_backend()}'; "
+        if backend_name == "gpu" else ""
+    )
     script = (
         "import time, os, sys, numpy as np; "
+        + check_gpu +
         "from jqscore.jqscore import compute_qscores, AtomRecord, read_cif, read_mrc; "
-        # Warmup: 2 dummy atoms + tiny 4x4x4 map -> triggers JIT compilation
+        # Device/runtime init: 2 dummy atoms + tiny 4x4x4 map
         "dummy_atoms = ["
         "AtomRecord('A',1,'','ALA','CA','C',0.,0.,0.),"
         "AtomRecord('A',1,'','ALA','N','N',1.,0.,0.)"
@@ -411,14 +419,26 @@ def run_jqscore(
 # Plotting
 # ---------------------------------------------------------------------------
 
-def count_non_hydrogen(cif_path: str) -> int:
-    """Count non-hydrogen atoms from a Q-score CIF using atom labels."""
-    atom_info, qscores = read_qscores(cif_path)
-    n_non_h = sum(
-        1 for name in atom_info.atom_name
-        if not str(name).strip().startswith("H")
+def _non_hydrogen_mask(cif_path: str) -> np.ndarray:
+    """Boolean mask of non-hydrogen rows in a Q-score CIF using type_symbol (fallback: atom name)."""
+    block = gemmi.cif.read(cif_path)[0]
+    symbols = block.find_values("_atom_site.type_symbol")
+    if symbols:
+        return np.fromiter(
+            (gemmi.Element(v).name.upper() != "H" for v in symbols),
+            dtype=bool, count=len(symbols),
+        )
+    atom_info, _ = read_qscores(cif_path)
+    return np.fromiter(
+        (not str(name).strip().lstrip("0123456789").upper().startswith("H")
+         for name in atom_info.atom_name),
+        dtype=bool, count=len(atom_info.atom_name),
     )
-    return n_non_h
+
+
+def count_non_hydrogen(cif_path: str) -> int:
+    """Count non-hydrogen atoms from a Q-score CIF."""
+    return int(_non_hydrogen_mask(cif_path).sum())
 
 
 def plot_structure_scatter(result: BenchmarkResult, output_dir: str) -> str:
@@ -428,11 +448,7 @@ def plot_structure_scatter(result: BenchmarkResult, output_dir: str) -> str:
     valid = np.isfinite(q_j) & np.isfinite(q_m)
 
     # Filter to non-H (read from jqscore CIF)
-    atom_info, _ = read_qscores(result.jqscore_cif)
-    non_h = np.array([
-        not str(name).strip().startswith("H")
-        for name in atom_info.atom_name
-    ])
+    non_h = _non_hydrogen_mask(result.jqscore_cif)
     mask = valid & non_h
 
     q_j_plot = q_j[mask]
@@ -482,11 +498,7 @@ def plot_summary(results: list[BenchmarkResult], output_dir: str) -> str:
         q_m = res.q_mapq
         valid = np.isfinite(q_j) & np.isfinite(q_m)
 
-        atom_info, _ = read_qscores(res.jqscore_cif)
-        non_h = np.array([
-            not str(name).strip().startswith("H")
-            for name in atom_info.atom_name
-        ])
+        non_h = _non_hydrogen_mask(res.jqscore_cif)
         mask = valid & non_h
 
         if mask.sum() == 0:
@@ -503,16 +515,17 @@ def plot_summary(results: list[BenchmarkResult], output_dir: str) -> str:
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 5))
 
     # --- Left panel: scatter of mean Q-scores (jqscore vs MapQ) ---
-    lo = min(float(np.min(mean_j)), float(np.min(mean_m))) - 0.02
-    hi = max(float(np.max(mean_j)), float(np.max(mean_m))) + 0.02
-    ax1.plot([lo, hi], [lo, hi], "r--", lw=0.8, label="y = x")
-    ax1.scatter(mean_m, mean_j, s=60, zorder=3)
-    for i, pid in enumerate(pdb_ids):
-        ax1.annotate(
-            pid, (mean_m[i], mean_j[i]),
-            textcoords="offset points", xytext=(6, 6),
-            fontsize=8, color="0.3",
-        )
+    if len(mean_j) > 0:
+        lo = min(float(np.min(mean_j)), float(np.min(mean_m))) - 0.02
+        hi = max(float(np.max(mean_j)), float(np.max(mean_m))) + 0.02
+        ax1.plot([lo, hi], [lo, hi], "r--", lw=0.8, label="y = x")
+        ax1.scatter(mean_m, mean_j, s=60, zorder=3)
+        for i, pid in enumerate(pdb_ids):
+            ax1.annotate(
+                pid, (mean_m[i], mean_j[i]),
+                textcoords="offset points", xytext=(6, 6),
+                fontsize=8, color="0.3",
+            )
     ax1.set_xlabel("MapQ mean Q-score (non-H)")
     ax1.set_ylabel("jqscore mean Q-score (non-H)")
     ax1.set_title("Structure-level Q-score agreement")
@@ -988,10 +1001,11 @@ def main() -> None:
             gpu_t = f"{r.jqscore_gpu_time:>8.1f}s"
         else:
             gpu_c = gpu_t = "      n/a"
+        max_abs_diff = max(abs(r.diff_min), abs(r.diff_max))
         print(
             f"{r.entry.pdb_id:>6} {r.entry.emdb_id:>12} "
             f"{r.entry.resolution:>5.2f} {r.n_non_h:>7} "
-            f"{r.pearson_r:>9.6f} {r.diff_mean:>10.6f} {r.diff_max:>10.6f} "
+            f"{r.pearson_r:>9.6f} {r.diff_mean:>10.6f} {max_abs_diff:>10.6f} "
             f"{r.mapq_time:>7.1f}s "
             f"{r.jqscore_cpu_compute_time:>8.1f}s {r.jqscore_cpu_time:>8.1f}s "
             f"{gpu_c} {gpu_t}"

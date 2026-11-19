@@ -59,14 +59,15 @@ def read_qscores(cif_path: str) -> tuple:
     # Try jqscore format first ("Q-score"), then MapQ format ("Q_score")
     raw = None
     for field in ("Q-score", "Q_score"):
-        col = block.find_loop(f"_atom_site.{field}")
+        col = block.find_values(f"_atom_site.{field}")
         if col:
             raw = list(col)
             break
     if raw is None:
         raise ValueError(f"No _atom_site.Q-score or _atom_site.Q_score in {cif_path}")
 
-    out = np.full(len(raw), np.nan, dtype=np.float64)
+    n = len(raw)
+    out = np.full(n, np.nan, dtype=np.float64)
     for i, s in enumerate(raw):
         s = str(s).strip()
         if s and s not in ("?", "."):
@@ -75,11 +76,18 @@ def read_qscores(cif_path: str) -> tuple:
             except ValueError:
                 pass
 
-    # Read atom labels
-    chain_col = list(block.find_loop("_atom_site.auth_asym_id"))
-    resid_col = list(block.find_loop("_atom_site.auth_seq_id"))
-    resname_col = list(block.find_loop("_atom_site.auth_comp_id"))
-    atomname_col = list(block.find_loop("_atom_site.auth_atom_id"))
+    # Read atom labels (prefer auth_*, fall back to label_* when absent, e.g. python-ihm CIFs)
+    def _col(*tags: str) -> list[str]:
+        for tag in tags:
+            c = block.find_values(f"_atom_site.{tag}")
+            if c and len(c) == n:
+                return list(c)
+        return ["?"] * n
+
+    chain_col = _col("auth_asym_id", "label_asym_id")
+    resid_col = _col("auth_seq_id", "label_seq_id")
+    resname_col = _col("auth_comp_id", "label_comp_id")
+    atomname_col = _col("auth_atom_id", "label_atom_id")
 
     atom_info = _CifAtomInfo(chain_col, resid_col, resname_col, atomname_col)
     return atom_info, out
@@ -120,7 +128,8 @@ def compare_qscores(path1: str, path2: str) -> CompareResult:
     d_min = float(np.min(diff_valid)) if n_valid else float("nan")
     d_mean = float(np.mean(diff_valid)) if n_valid else float("nan")
     d_max = float(np.max(diff_valid)) if n_valid else float("nan")
-    r = float(np.corrcoef(q1[valid], q2[valid])[0, 1]) if n_valid > 1 else float("nan")
+    with np.errstate(invalid="ignore", divide="ignore"):
+        r = float(np.corrcoef(q1[valid], q2[valid])[0, 1]) if n_valid > 1 else float("nan")
 
     labels = [_atom_label(struct1, i) for i in range(len(q1))]
 
@@ -162,12 +171,12 @@ def _print_result(result: CompareResult, path1: str, path2: str, n_extremes: int
 
 
 def main() -> None:
-    """CLI entry point: compare_qscores file1.cif file2.cif"""
+    """CLI entry point: compare-qscores file1.cif file2.cif"""
     if len(sys.argv) != 3:
         print(main.__doc__, file=sys.stderr)
         print(
             "\nUsage:\n"
-            "  compare_qscores file1.cif file2.cif\n"
+            "  compare-qscores file1.cif file2.cif\n"
             "  python -m jqscore.compare file1.cif file2.cif",
             file=sys.stderr,
         )

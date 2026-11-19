@@ -242,15 +242,100 @@ class TestFlatDensity:
         np.testing.assert_allclose(q_shifted, q, atol=1e-6)
 
     def test_far_outlier_voxel_changes_nothing(self):
-        """One extreme voxel far from the atoms leaves their Q-scores unchanged."""
+        """One extreme voxel far from the atoms leaves their Q-scores unchanged (retry and fast)."""
         centre = [10.0, 10.0, 10.0]
         data, origin, voxel_size = TestComputeQscoresSynthetic._make_gaussian_map(centre)
         atoms = [AtomRecord("A", i, "", "ALA", "CA", "C", 9.0 + i * 0.5, 10.2, 9.7) for i in range(5)]
-        q = compute_qscores(atoms, data, origin, voxel_size, sigma=0.4).atom_qscores
-        data[0, 0, 19] = 1e35
-        q_outlier = compute_qscores(atoms, data, origin, voxel_size, sigma=0.4).atom_qscores
-        assert np.all(np.abs(q) > 0.1)
-        np.testing.assert_allclose(q_outlier, q, atol=1e-6)
+        for use_retry in (True, False):
+            d_clean = data.copy()
+            q = compute_qscores(atoms, d_clean, origin, voxel_size, sigma=0.4, use_retry=use_retry).atom_qscores
+            d_out = data.copy()
+            d_out[0, 0, 19] = 1e35
+            q_outlier = compute_qscores(atoms, d_out, origin, voxel_size, sigma=0.4, use_retry=use_retry).atom_qscores
+            assert np.all(np.abs(q) > 0.1)
+            np.testing.assert_allclose(q_outlier, q, atol=1e-6)
+
+    def test_fast_mode_small_scale_and_dc_offset(self):
+        """Fast mode (use_retry=False) stays accurate on tiny-scale and DC-shifted maps."""
+        centre = [10.0, 10.0, 10.0]
+        data, origin, voxel_size = TestComputeQscoresSynthetic._make_gaussian_map(centre)
+        atoms = [AtomRecord("A", 1, "", "ALA", "CA", "C", *centre)]
+        q_base = compute_qscores(atoms, data, origin, voxel_size, use_retry=False, mapq_compat=False).atom_qscores[0]
+
+        q_small = compute_qscores(atoms, (data * np.float32(1e-10)), origin, voxel_size,
+                                  use_retry=False, mapq_compat=False).atom_qscores[0]
+        assert q_small == pytest.approx(q_base, abs=1e-5)
+
+        d_shift = (1e6 + data.astype(np.float64)).astype(np.float32)
+        d_unshift = (d_shift - np.float32(1e6)).astype(np.float32)
+        q_s = compute_qscores(atoms, d_shift, origin, voxel_size, use_retry=False, mapq_compat=False).atom_qscores[0]
+        q_u = compute_qscores(atoms, d_unshift, origin, voxel_size, use_retry=False, mapq_compat=False).atom_qscores[0]
+        assert q_s == pytest.approx(q_u, abs=1e-5)
+
+    def test_tiny_scale_map_not_zeroed_by_map_stats(self):
+        """A tiny-amplitude map keeps accurate min_d/max_d and Q-scores (no _map_stats denormal flush)."""
+        centre = [10.0, 10.0, 10.0]
+        data, origin, voxel_size = TestComputeQscoresSynthetic._make_gaussian_map(centre)
+        atoms = [AtomRecord("A", 1, "", "ALA", "CA", "C", *centre)]
+        q_ref = compute_qscores(atoms, data, origin, voxel_size, mapq_compat=False).atom_qscores[0]
+        # 1e-16: all shell deviations stay above _DEV_FLOOR (2^-63 ≈ 1.08e-19)
+        r_small = compute_qscores(atoms, (data.astype(np.float64) * 1e-16).astype(np.float32),
+                                  origin, voxel_size, mapq_compat=False)
+        assert r_small.max_d > r_small.min_d
+        assert r_small.atom_qscores[0] == pytest.approx(q_ref, abs=1e-4)
+        # 1e-18: unscaled squared variance (~1e-39) would flush to 0 on CPU without _map_stats scaling
+        r_tiny = compute_qscores(atoms, (data.astype(np.float64) * 1e-18).astype(np.float32),
+                                 origin, voxel_size, mapq_compat=False)
+        assert r_tiny.max_d > r_tiny.min_d
+        assert r_tiny.atom_qscores[0] > 0.8
+
+    def test_input_validation(self):
+        centre = [10.0, 10.0, 10.0]
+        data, origin, voxel_size = TestComputeQscoresSynthetic._make_gaussian_map(centre)
+        atoms = [AtomRecord("A", 1, "", "ALA", "CA", "C", *centre)]
+        with pytest.raises(ValueError, match="sigma"):
+            compute_qscores(atoms, data, origin, voxel_size, sigma=0.0)
+        with pytest.raises(ValueError, match="sigma"):
+            compute_qscores(atoms, data, origin, voxel_size, sigma=float("nan"))
+        with pytest.raises(ValueError, match="to_rad"):
+            compute_qscores(atoms, data, origin, voxel_size, to_rad=float("nan"))
+        with pytest.raises(ValueError, match="d_rad"):
+            compute_qscores(atoms, data, origin, voxel_size, d_rad=float("inf"))
+        with pytest.raises(ValueError, match="num_pts"):
+            compute_qscores(atoms, data, origin, voxel_size, num_pts=0)
+        with pytest.raises(ValueError, match="batch_size"):
+            compute_qscores(atoms, data, origin, voxel_size, batch_size=0)
+        with pytest.raises(ValueError, match="Empty"):
+            compute_qscores(atoms, np.empty((0, 0, 0), dtype=np.float32), origin, voxel_size)
+
+    def test_cli_handles_none_res_seq(self, tmp_path, monkeypatch, capsys):
+        """CLI sorting must not fail when a residue has auth_seq_id='?' (res_seq=None)."""
+        import sys
+        import gemmi
+        from jqscore.jqscore import _cli
+
+        cif = tmp_path / "none_seq.cif"
+        cif.write_text(
+            "data_n\nloop_\n"
+            "_atom_site.group_PDB _atom_site.id _atom_site.type_symbol "
+            "_atom_site.label_atom_id _atom_site.label_alt_id _atom_site.label_comp_id "
+            "_atom_site.label_asym_id _atom_site.label_entity_id _atom_site.label_seq_id "
+            "_atom_site.Cartn_x _atom_site.Cartn_y _atom_site.Cartn_z "
+            "_atom_site.auth_seq_id _atom_site.auth_asym_id\n"
+            "ATOM 1 C CA . ALA A 1 1 5.0 5.0 5.0 1 A\n"
+            "HETATM 2 ZN ZN . ZN B 2 . 6.0 5.0 5.0 ? A\n"
+        )
+        data, _, _ = TestComputeQscoresSynthetic._make_gaussian_map([5.0, 5.0, 5.0], shape=(12, 12, 12))
+        m = gemmi.Ccp4Map()
+        m.grid = gemmi.FloatGrid(data.transpose(2, 1, 0), gemmi.UnitCell(12, 12, 12, 90, 90, 90))
+        m.update_ccp4_header()
+        mrc = tmp_path / "m.mrc"
+        m.write_ccp4_map(str(mrc))
+
+        monkeypatch.setattr(sys, "argv", ["jqscore", str(cif), str(mrc)])
+        _cli()
+        out = capsys.readouterr().out
+        assert "Chain A:" in out and "ZN" in out
 
 
 # ── End-to-end on 390_7cec_A100 (in-repo, 100 atoms, sigma=0.6) ────────

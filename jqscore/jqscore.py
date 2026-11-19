@@ -50,7 +50,7 @@ import heapq
 import itertools
 import time
 import warnings
-from collections import defaultdict
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -147,7 +147,10 @@ def read_mrc(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     sampling = np.array([m.header_i32(8), m.header_i32(9), m.header_i32(10)],
                         dtype=np.float64)
     sampling = np.where(sampling > 0, sampling, n_xyz)
-    voxel_size = cell / sampling
+    with np.errstate(divide="ignore", invalid="ignore"):
+        voxel_size = cell / sampling
+    if not (np.isfinite(voxel_size).all() and np.all(voxel_size > 0)):
+        raise ValueError(f"Invalid voxel size {voxel_size.tolist()} in MRC header of {path}")
 
     # MRC2000 origin (header words 50-52)
     origin = np.array(
@@ -156,7 +159,7 @@ def read_mrc(path: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     )
 
     # Fall back to nxstart / nystart / nzstart (words 5-7) for old CCP4 files
-    if np.all(origin == 0.0) and voxel_size[0] > 0:
+    if np.all(origin == 0.0):
         origin = start_xyz * voxel_size
 
     # gemmi grid shape = (nu, nv, nw) = (NC, NR, NS) in Fortran order; its
@@ -193,8 +196,8 @@ def _gemmi_model_to_atom_records(model) -> List[AtomRecord]:
             for atom in res:
                 el = atom.element.name.strip().upper()
                 if not el:
-                    an = atom.name.strip()
-                    el = an.lstrip("0123456789").lstrip()[0].upper() if an else ""
+                    an = atom.name.strip().lstrip("0123456789").lstrip()
+                    el = an[0].upper() if an else ""
                 alt = atom.altloc if atom.altloc not in ('\x00', ' ', '') else ""
                 pos = atom.pos
                 append(AtomRecord(chain_id, res_seq, ins, res_name, atom.name, el,
@@ -207,6 +210,8 @@ def read_pdb(path: str) -> List[AtomRecord]:
     if not _HAVE_GEMMI:
         raise ImportError("gemmi is required for structure I/O: pip install gemmi")
     st = gemmi.read_structure(path)
+    if len(st) == 0:
+        raise ValueError(f"No models found in {path}")
     return _gemmi_model_to_atom_records(st[0])
 
 
@@ -223,6 +228,8 @@ def read_cif(path: str) -> List[AtomRecord]:
         raise ImportError("gemmi is required for structure I/O: pip install gemmi")
     # What gemmi.read_structure does for mmCIF, without the unused categories
     doc = gemmi.cif.read(path)
+    if len(doc) == 0:
+        raise ValueError(f"No data blocks found in {path}")
     block = doc[0]
     for name in _UNUSED_CIF_CATEGORIES:
         table = block.find_mmcif_category(name)
@@ -230,6 +237,8 @@ def read_cif(path: str) -> List[AtomRecord]:
             table.erase()
     st = gemmi.make_structure_from_block(block)
     del table, block, doc       # the parsed text: several GB for the largest entries
+    if len(st) == 0:
+        raise ValueError(f"No models found in {path}")
     st.merge_chain_parts()
     return _gemmi_model_to_atom_records(st[0])
 
@@ -277,9 +286,53 @@ class AtomSiteColumns:
     def floats(self, tag):
         if tag not in self._floats:
             values = self.block.find_values("_atom_site." + tag)
-            self._floats[tag] = (np.fromiter(values, dtype=np.float64, count=len(values))
-                                 if values else None)
+            if not values:
+                self._floats[tag] = None
+            else:
+                try:
+                    self._floats[tag] = np.fromiter(values, dtype=np.float64, count=len(values))
+                except ValueError:
+                    self._floats[tag] = np.fromiter(
+                        (gemmi.cif.as_number(v) for v in values),
+                        dtype=np.float64, count=len(values),
+                    )
         return self._floats[tag]
+
+
+def _is_signed_int(v: str) -> bool:
+    return bool(v) and (v[1:] if v[0] in "+-" else v).isdigit()
+
+
+def _codes_with_fallback(columns, auth_tag: str, label_tag: str):
+    """``(distinct, code, merged)`` for *auth_tag*, falling back per-row to
+    *label_tag* when *auth_tag* is absent or '?'/'.' (matching gemmi).
+    *merged* is True only when rows from both columns were combined."""
+    primary = columns.codes(auth_tag)
+    if primary is None:
+        fb = columns.codes(label_tag)
+        return (fb[0], fb[1], False) if fb is not None else None
+    distinct, code = primary
+    if "?" not in distinct and "." not in distinct:
+        return distinct, code, False
+    fallback = columns.codes(label_tag)
+    if fallback is None:
+        return distinct, code, False
+    missing_codes = [i for i, v in enumerate(distinct) if v in ("?", ".")]
+    mask = np.isin(code, missing_codes)
+    if not mask.any():
+        return distinct, code, False
+    fb_distinct, fb_code = fallback
+    combined = list(distinct)
+    index = {v: i for i, v in enumerate(combined)}
+    fb_map = np.empty(len(fb_distinct), dtype=np.int64)
+    for i, v in enumerate(fb_distinct):
+        if v not in index:
+            index[v] = len(combined)
+            combined.append(v)
+        fb_map[i] = index[v]
+    out_code = code.copy()
+    out_code[mask] = fb_map[fb_code[mask]]
+    return combined, out_code, True
 
 
 def _atom_site_arrays(block, columns=None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -306,13 +359,23 @@ def _atom_site_arrays(block, columns=None) -> Tuple[np.ndarray, np.ndarray, np.n
         return rows, np.empty((0, 3)), np.empty(0, dtype=bool), np.empty(0, dtype=np.int64)
 
     # Chains in order of first appearance, the file's order within each
-    chain_names, chain = columns.codes("auth_asym_id", "label_asym_id")
+    chain_col = _codes_with_fallback(columns, "auth_asym_id", "label_asym_id")
+    if chain_col is None:
+        raise ValueError("No _atom_site.auth_asym_id or _atom_site.label_asym_id column")
+    chain_names, chain, chain_merged = chain_col
     if len(rows) < n_total:
         chain = np.unique(chain[rows], return_inverse=True)[1]
         first = np.full(chain.max() + 1, len(rows))
         np.minimum.at(first, chain, np.arange(len(rows)))
         rank = np.argsort(np.argsort(first, kind="stable"), kind="stable")
         chain = rank[chain]
+    elif chain_merged:
+        # Per-row fallback may introduce codes out of first-appearance order
+        first = np.full(len(chain_names), len(rows))
+        np.minimum.at(first, chain, np.arange(len(rows)))
+        if not np.all(first[1:] >= first[:-1]):
+            rank = np.argsort(np.argsort(first, kind="stable"), kind="stable")
+            chain = rank[chain]
     if not np.all(chain[1:] >= chain[:-1]):
         order = np.argsort(chain, kind="stable")
         rows, chain = rows[order], chain[order]
@@ -325,13 +388,19 @@ def _atom_site_arrays(block, columns=None) -> Tuple[np.ndarray, np.ndarray, np.n
         distinct, code = symbols
         heavy = np.array([gemmi.Element(v).name.upper() != "H" for v in distinct], dtype=bool)[code[idx]]
     else:   # (read_cif fails here) the element from the name, as for a blank type_symbol
-        distinct, code = columns.codes("label_atom_id", "auth_atom_id")
+        atom_col = _codes_with_fallback(columns, "label_atom_id", "auth_atom_id")
+        if atom_col is None:
+            raise ValueError("No _atom_site.type_symbol, label_atom_id, or auth_atom_id column")
+        distinct, code, _ = atom_col
         heavy = np.array([not v.lstrip("0123456789").upper().startswith("H") for v in distinct],
                          dtype=bool)[code[idx]]
 
     # Residue: chain, number, insertion code (as AtomRecord's chain_id, res_seq, ins_code)
-    distinct, code = columns.codes("auth_seq_id", "label_seq_id")
-    numbers = np.array([int(v) if v.lstrip("+-").isdigit() else _UNKNOWN_SEQ for v in distinct],
+    seq_col = _codes_with_fallback(columns, "auth_seq_id", "label_seq_id")
+    if seq_col is None:
+        raise ValueError("No _atom_site.auth_seq_id or _atom_site.label_seq_id column")
+    distinct, code, _ = seq_col
+    numbers = np.array([int(v) if _is_signed_int(v) else _UNKNOWN_SEQ for v in distinct],
                        dtype=np.int64)
     _, num_code = np.unique(numbers, return_inverse=True)
     number = num_code[code[idx]]
@@ -365,18 +434,34 @@ def block_qscores(block, data: np.ndarray, origin: np.ndarray, voxel_size: np.nd
 
 
 def add_qscore_column(block, q_scores: np.ndarray) -> None:
-    """Add an ``_atom_site.Q-score`` column to a gemmi mmCIF block, as MapQ writes it.
+    """Add or update an ``_atom_site.Q-score`` column in a gemmi mmCIF block, as MapQ writes it.
 
     One value per ``_atom_site`` row, with six decimals; "?" for NaN.
     """
+    col_x = block.find_values("_atom_site.Cartn_x")
+    if not col_x:
+        raise ValueError("No _atom_site table")
+    q_list = np.asarray(q_scores, dtype=np.float64).tolist()
     loop = block.find_loop("_atom_site.Cartn_x").get_loop()
-    if loop.length() != len(q_scores):
-        raise ValueError(f"{len(q_scores)} Q-scores for {loop.length()} atom_site rows")
-    loop.add_columns(["_atom_site.Q-score"], "?")
+    if loop is None:
+        if len(col_x) != len(q_list):
+            raise ValueError(f"{len(q_list)} Q-scores for {len(col_x)} atom_site rows")
+        q = q_list[0]
+        block.set_pair("_atom_site.Q-score", f"{q:.6f}" if q == q else "?")
+        return
+    if loop.length() != len(q_list):
+        raise ValueError(f"{len(q_list)} Q-scores for {loop.length()} atom_site rows")
+    existed = "_atom_site.Q-score" in loop.tags
+    if not existed:
+        loop.add_columns(["_atom_site.Q-score"], "?")
     column = block.find_values("_atom_site.Q-score")
-    for row, q in enumerate(np.asarray(q_scores, dtype=np.float64).tolist()):
-        if q == q:      # not NaN
-            column[row] = f"{q:.6f}"
+    if existed:
+        for row, q in enumerate(q_list):
+            column[row] = f"{q:.6f}" if q == q else "?"
+    else:
+        for row, q in enumerate(q_list):
+            if q == q:      # not NaN
+                column[row] = f"{q:.6f}"
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +481,10 @@ def min_max_d(data: np.ndarray) -> Tuple[float, float]:
     JAX default device.
     """
     _require_jax()
-    mean, std, min_val, max_val = (float(v) for v in jax.device_get(_map_stats(jnp.asarray(data))))
+    arr = jnp.asarray(data, dtype=jnp.float32)
+    if arr.size == 0:
+        raise ValueError("Empty density map")
+    mean, std, min_val, max_val = (float(v) for v in jax.device_get(_map_stats(arr)))
     max_d = min(mean + 10.0 * std, max_val)
     min_d = max(mean -  1.0 * std, min_val)
     return min_d, max_d
@@ -412,9 +500,19 @@ def _map_stats(data):
         return x
 
     n = data.size
-    mean = total(data) / n
-    std = jnp.sqrt(total(jnp.square(data - mean)) / n)
-    return mean, std, jnp.min(data), jnp.max(data)
+    min_val = jnp.min(data)
+    max_val = jnp.max(data)
+    peak = jnp.maximum(jnp.abs(min_val), jnp.abs(max_val))
+    # Exact power-of-two rescaling so sums and squared deviations neither
+    # overflow float32 nor flush to denormals on extreme-scale maps
+    safe_peak = jnp.where(jnp.isfinite(peak) & (peak > jnp.float32(0.0)), peak, jnp.float32(1.0))
+    _, exp = jnp.frexp(safe_peak)
+    exp = jnp.clip(exp, -125, 125)
+    inv_scale = jnp.ldexp(jnp.float32(1.0), -exp)
+    scale = jnp.ldexp(jnp.float32(1.0), exp)
+    mean_s = total(data * inv_scale) / n
+    std_s = jnp.sqrt(total(jnp.square(data * inv_scale - mean_s)) / n)
+    return mean_s * scale, std_s * scale, min_val, max_val
 
 
 if _HAVE_JAX:
@@ -430,10 +528,12 @@ def _sphere_directions(n: int) -> np.ndarray:
         return _sphere_dir_cache[n]
     if n <= 0:
         d: np.ndarray = np.empty((0, 3), dtype=np.float64)
+        d.setflags(write=False)
         _sphere_dir_cache[n] = d
         return d
     if n == 1:
         d = np.array([[0.0, 0.0, 1.0]], dtype=np.float64)
+        d.setflags(write=False)
         _sphere_dir_cache[n] = d
         return d
 
@@ -453,6 +553,7 @@ def _sphere_directions(n: int) -> np.ndarray:
     d[:, 0] = sp * np.cos(theta)
     d[:, 1] = sp * np.sin(theta)
     d[:, 2] = np.cos(phi)
+    d.setflags(write=False)
     _sphere_dir_cache[n] = d
     return d
 
@@ -613,6 +714,14 @@ def _trilinear_split(data, grid_pts):
     gy = grid_pts[:, 1]
     gz = grid_pts[:, 2]
 
+    # Bounds check in float32 before int32 cast: on GPU int32(NaN) == 0, which
+    # would otherwise pass an integer bounds check (while CPU gives INT32_MIN)
+    inside = (
+        (gx >= jnp.float32(0.0)) & (gx < jnp.float32(nx - 1)) &
+        (gy >= jnp.float32(0.0)) & (gy < jnp.float32(ny - 1)) &
+        (gz >= jnp.float32(0.0)) & (gz < jnp.float32(nz - 1))
+    )
+
     ix = jnp.floor(gx).astype(jnp.int32)
     iy = jnp.floor(gy).astype(jnp.int32)
     iz = jnp.floor(gz).astype(jnp.int32)
@@ -621,15 +730,9 @@ def _trilinear_split(data, grid_pts):
     fy = gy - iy
     fz = gz - iz
 
-    inside = (
-        (ix >= 0) & (ix <= nx - 2) &
-        (iy >= 0) & (iy <= ny - 2) &
-        (iz >= 0) & (iz <= nz - 2)
-    )
-
-    cx = jnp.clip(ix, 0, nx - 2)
-    cy = jnp.clip(iy, 0, ny - 2)
-    cz = jnp.clip(iz, 0, nz - 2)
+    cx = jnp.clip(ix, 0, max(0, nx - 2))
+    cy = jnp.clip(iy, 0, max(0, ny - 2))
+    cz = jnp.clip(iz, 0, max(0, nz - 2))
 
     # Corners c[z][y][x] of the cell
     c000 = data[cz,     cy,     cx    ]
@@ -668,6 +771,13 @@ def _trilinear_grid(data, grid_pts):
     return r + delta
 
 
+# Density deviations below this (in the map's units) are 0: their squares
+# would be float32 denormals, which XLA flushes to 0 on the CPU but keeps on
+# the GPU, so the two would differ in near-zero density (e.g. at the edge of
+# a masked map, where values of 1e-30 and less occur)
+_DEV_FLOOR = 2.0 ** -63
+
+
 def _masked_pearson(d, g, mask):
     """Pearson correlation with a boolean validity mask.
 
@@ -692,12 +802,14 @@ def _masked_pearson(d, g, mask):
     cd   = jnp.where(mask, d - mu_d, jnp.float32(0.0))
     cg   = jnp.where(mask, g - mu_g, jnp.float32(0.0))
 
-    num      = jnp.dot(cd, cg)
-    denom_sq = jnp.dot(cd, cd) * jnp.dot(cg, cg)
+    num   = jnp.dot(cd, cg)
+    denom = jnp.sqrt(jnp.dot(cd, cd)) * jnp.sqrt(jnp.dot(cg, cg))
+    ok    = denom > jnp.float32(0.0)
+    safe_denom = jnp.where(ok, denom, jnp.float32(1.0))
 
     return jnp.where(
-        denom_sq > jnp.float32(0.0),
-        num / jnp.sqrt(jnp.maximum(denom_sq, jnp.float32(1e-30))),
+        ok,
+        jnp.clip(num / safe_denom, jnp.float32(-1.0), jnp.float32(1.0)),
         jnp.float32(0.0),
     )
 
@@ -769,6 +881,7 @@ def _make_compute_fn(n_gen: int, num_pts: int):
 
             r_p, delta_p = _trilinear_split(data, atom_grid + (sphere_dirs * r) / voxel_size)
             d_vals = (r_p - r_c) + (delta_p - delta_c)
+            d_vals = jnp.where(jnp.abs(d_vals) >= _DEV_FLOOR, d_vals, jnp.float32(0.0))
             g_vals = jnp.full((n_gen,), gv, dtype=jnp.float32)
 
             return None, (d_vals, g_vals, sph_ok)
@@ -841,13 +954,6 @@ def _retry_rounds(num_pts: int, max_retries: int) -> List[_RetryRound]:
         ))
         first = end
     return rounds
-
-
-# Density deviations below this (in the map's units) are 0: their squares
-# would be float32 denormals, which XLA flushes to 0 on the CPU but keeps on
-# the GPU, so the two would differ in near-zero density (e.g. at the edge of
-# a masked map, where values of 1e-30 and less occur)
-_DEV_FLOOR = 2.0 ** -63
 
 
 def _make_shell_fn(rnd: _RetryRound, num_pts: int):
@@ -1178,28 +1284,31 @@ class _GpuCellList:
     @classmethod
     def build(cls, coords: np.ndarray, radius: float) -> Optional[_GpuCellList]:
         n = len(coords)
-        if n == 0:
+        if n == 0 or radius <= 0.0:
+            return None
+        coords_f64 = np.asarray(coords, dtype=np.float64)
+        if not np.isfinite(coords_f64).all():
             return None
         r_bound = float(np.nextafter(radius, np.inf))
-        inv_cell = np.float32(1.0 / (r_bound * 1.0001))
-        coords_f32 = coords.astype(np.float32)
+        inv_cell = 1.0 / (r_bound * 1.0001)
 
-        cx = coords_f32[:, 0]
-        ix = ((cx - cx.min()) * inv_cell + np.float32(1.0)).astype(np.int32)
-        nx = int(ix.max()) + 2
+        mins = coords_f64.min(axis=0)
+        maxs = coords_f64.max(axis=0)
+        spans = (maxs - mins) * inv_cell
+        if not np.isfinite(spans).all() or np.any(spans > 200_000_000):
+            return None
 
-        cy = coords_f32[:, 1]
-        iy = ((cy - cy.min()) * inv_cell + np.float32(1.0)).astype(np.int32)
-        ny = int(iy.max()) + 2
-
-        cz = coords_f32[:, 2]
-        iz = ((cz - cz.min()) * inv_cell + np.float32(1.0)).astype(np.int32)
-        nz = int(iz.max()) + 4
-        del coords_f32, cx, cy, cz
-
+        nx = int(np.floor(spans[0])) + 3
+        ny = int(np.floor(spans[1])) + 3
+        nz = int(np.floor(spans[2])) + 5
         n_cells = nx * ny * nz
         if n_cells > 200_000_000:
             return None
+
+        ix = (np.floor((coords_f64[:, 0] - mins[0]) * inv_cell) + 1.0).astype(np.int32)
+        iy = (np.floor((coords_f64[:, 1] - mins[1]) * inv_cell) + 1.0).astype(np.int32)
+        iz = (np.floor((coords_f64[:, 2] - mins[2]) * inv_cell) + 1.0).astype(np.int32)
+
         cell_id = (ix * ny + iy) * nz + iz
         del ix, iy, iz
         order = np.argsort(cell_id, kind="stable").astype(np.int32)
@@ -1315,7 +1424,31 @@ def _resample_mapq_compat(data, origin: np.ndarray, voxel_size: np.ndarray):
     offset_xyz = (new_origin - O) / vs
     offset_zyx = tuple(float(o) for o in offset_xyz[::-1])
 
-    return _shift_linear(jnp.asarray(data, dtype=jnp.float32), offset_zyx), new_origin
+    jdata = jnp.asarray(data, dtype=jnp.float32)
+    return _shift_linear(jdata, offset_zyx), new_origin
+
+
+def _shift_linear_impl(data, signs, offsets):
+    for axis, sign in enumerate(signs):
+        if sign == 0:
+            continue
+        off = offsets[axis]
+        n = data.shape[axis]
+        lo = lax.slice_in_dim(data, 0, n - 1, axis=axis)
+        hi = lax.slice_in_dim(data, 1, n, axis=axis)
+        edge = jnp.zeros_like(lax.slice_in_dim(data, 0, 1, axis=axis))
+        # lo + t*(hi - lo): exact where hi == lo, so a constant region stays constant
+        # whether or not the backend fuses the multiply-add (a weighted sum of lo and hi
+        # is off by an ULP that depends on it)
+        if sign > 0:    # between i and i+1; the last voxel's source is past the end
+            data = jnp.concatenate([lo + off * (hi - lo), edge], axis=axis)
+        else:           # between i-1 and i; the first voxel's source is before the start
+            data = jnp.concatenate([edge, hi + off * (hi - lo)], axis=axis)
+    return data
+
+
+if _HAVE_JAX:
+    _shift_linear_jit = jit(_shift_linear_impl, static_argnums=1)
 
 
 def _shift_linear(data, offsets):
@@ -1326,25 +1459,10 @@ def _shift_linear(data, offsets):
     outside ``[0, n-1]`` on any axis is 0.  One axis at a time (trilinear
     interpolation is separable).
     """
-    for axis, off in enumerate(offsets):
-        if off == 0.0:
-            continue
-        n = data.shape[axis]
-        lo = lax.slice_in_dim(data, 0, n - 1, axis=axis)
-        hi = lax.slice_in_dim(data, 1, n, axis=axis)
-        edge = jnp.zeros_like(lax.slice_in_dim(data, 0, 1, axis=axis))
-        # lo + t*(hi - lo): exact where hi == lo, so a constant region stays constant
-        # whether or not the backend fuses the multiply-add (a weighted sum of lo and hi
-        # is off by an ULP that depends on it)
-        if off > 0:     # between i and i+1; the last voxel's source is past the end
-            data = jnp.concatenate([lo + off * (hi - lo), edge], axis=axis)
-        else:           # between i-1 and i; the first voxel's source is before the start
-            data = jnp.concatenate([edge, hi + off * (hi - lo)], axis=axis)
-    return data
-
-
-if _HAVE_JAX:
-    _shift_linear = jit(_shift_linear, static_argnums=1)
+    if all(off == 0.0 for off in offsets):
+        return data
+    signs = tuple(1 if off > 0.0 else (-1 if off < 0.0 else 0) for off in offsets)
+    return _shift_linear_jit(data, signs, jnp.asarray(offsets, dtype=jnp.float32))
 
 
 # ---------------------------------------------------------------------------
@@ -1394,6 +1512,18 @@ def qscores_from_arrays(
     _require_jax()
     if max_retries < 1:
         raise ValueError(f"max_retries must be ≥ 1, got {max_retries}")
+    if not (sigma > 0 and np.isfinite(sigma)):
+        raise ValueError(f"sigma must be finite and > 0, got {sigma}")
+    if num_pts < 1:
+        raise ValueError(f"num_pts must be ≥ 1, got {num_pts}")
+    if batch_size is not None and batch_size < 1:
+        raise ValueError(f"batch_size must be ≥ 1 or None, got {batch_size}")
+    if to_rad is not None and not (to_rad > 0 and np.isfinite(to_rad)):
+        raise ValueError(f"to_rad must be finite and > 0, got {to_rad}")
+    if d_rad is not None and not (d_rad > 0 and np.isfinite(d_rad)):
+        raise ValueError(f"d_rad must be finite and > 0, got {d_rad}")
+    if nbr_radius is not None and not (nbr_radius > 0 and np.isfinite(nbr_radius)):
+        raise ValueError(f"nbr_radius must be finite and > 0, got {nbr_radius}")
 
     t_start = time.perf_counter()
 
@@ -1411,6 +1541,10 @@ def qscores_from_arrays(
     # The map goes to the device once; statistics and resampling are
     # dispatched asynchronously so host coordinate/cell-list setup overlaps
     jdata_in = jnp.asarray(data, dtype=jnp.float32)
+    if jdata_in.size == 0:
+        if jdata_in is not data:
+            jdata_in.delete()
+        raise ValueError("Empty density map")
     stats_dev = _map_stats(jdata_in)
     if mapq_compat:
         _log("[mapq_compat] Resampling map to replicate MaskMapResize origin rounding …")
@@ -1425,7 +1559,7 @@ def qscores_from_arrays(
         mean, std, min_val, max_val = (float(v) for v in jax.device_get(stats_dev))
         max_d = min(mean + 10.0 * std, max_val)
         min_d = max(mean -  1.0 * std, min_val)
-        if mapq_compat and jdata_in is not data:
+        if jdata_in is not jdata and jdata_in is not data:
             jdata_in.delete()
         if jdata is not data:
             jdata.delete()
@@ -1456,7 +1590,7 @@ def qscores_from_arrays(
     mean, std, min_val, max_val = (float(v) for v in jax.device_get(stats_dev))
     max_d = min(mean + 10.0 * std, max_val)
     min_d = max(mean -  1.0 * std, min_val)
-    if mapq_compat and jdata_in is not data:
+    if jdata_in is not jdata and jdata_in is not data:
         jdata_in.delete()
 
     # Coordinates as float32 pairs (see _relative_coords); neighbour slots
@@ -1472,10 +1606,12 @@ def qscores_from_arrays(
     else:
         groups = _neighbour_groups(neighbours.counts(non_h_coords))
 
-    A     = float(max_d - min_d)
-    B     = float(min_d)
-    gv_r0 = float(A + B)
-    gv_shells_np = A * np.exp(-0.5 * (shell_radii_np.astype(np.float64) / sigma) ** 2) + B
+    # Pearson correlation is invariant to affine rescaling of the reference Gaussian.
+    # Keep it unit-scale so Q-scores do not depend on map statistics (and float32
+    # fast mode neither overflows on outlier maps nor loses precision to a DC offset);
+    # constant maps already produce zero density variance and Q = 0.
+    gv_r0 = 1.0
+    gv_shells_np = np.exp(-0.5 * (shell_radii_np.astype(np.float64) / sigma) ** 2)
 
     origin_np = np.asarray(origin, dtype=np.float64)
     vs_np     = np.asarray(voxel_size, dtype=np.float64)
@@ -1487,7 +1623,7 @@ def qscores_from_arrays(
     # None = a single batch per group (may OOM for large structures).
     batches = []
     for members, k in groups:
-        size = len(members) if batch_size is None else max(1, min(batch_size, len(members)))
+        size = len(members) if batch_size is None else min(batch_size, len(members))
         batches += [(members[i:i + size], size, k) for i in range(0, len(members), size)]
     _log(f"Computing Q-scores:  {N} atoms  ×  {len(shell_radii_np)} shells  "
          f"({len(batches)} batch{'es' if len(batches) > 1 else ''} of ≤ {batches[0][1]} atoms, "
@@ -1611,7 +1747,9 @@ def compute_qscores(
         Map coordinate system.
     sigma : float
         Gaussian width in Ångströms.  Default 0.4 Å (EMDB convention).
-        Use 0.6 for older datasets, or larger values for SSE scoring.
+        Use 0.6 for older datasets.  Note: for ``sigma ≥ 1.0``, jqscore expands
+        ``to_rad=6.0`` and ``d_rad=0.5`` while still scoring and excluding all
+        non-H atoms (unlike MapQ, which restricts ``sigma ≥ 1.0`` to CA atoms).
     num_pts : int
         Target sample points per shell.
     to_rad, d_rad : float, optional
@@ -1643,7 +1781,7 @@ def compute_qscores(
 
         Set to ``False`` for the physically more accurate computation (single
         interpolation directly from the original map).  See
-        ``docs/jqscore_vs_mapq/mapq_trimmed_map_discrepancy.md`` for details.
+        ``docs/jqscore_vs_mapq/README.md`` for details.
     batch_size : int or None, default 32768
         Number of atoms per batch.  Device memory per batch grows with this
         value (the map itself is on the device throughout).  Reduce for tight
@@ -1769,47 +1907,140 @@ def write_qscore_cif(
     out_path = os.path.join(output_dir, f"{cif_basename}__Q__{map_basename}.cif")
 
     doc = gemmi.cif.read(input_cif_path)
+    if len(doc) == 0:
+        raise ValueError(f"No data blocks found in {input_cif_path}")
     block = doc[0]
+    columns = AtomSiteColumns(block)
+    x_col = columns.floats("Cartn_x")
+    if x_col is None:
+        raise ValueError(f"No _atom_site table in {input_cif_path}")
+    n_total = len(x_col)
 
-    # Count atoms in the CIF atom_site loop
-    id_col = block.find_loop("_atom_site.id")
-    n_atoms = len(id_col) if id_col else 0
+    # First-model rows only (handles multi-model CIFs without reading extra columns
+    # when all rows belong to one model)
+    rows = np.arange(n_total, dtype=np.int64)
+    if n_total != len(result.atom_qscores):
+        model = columns.codes("pdbx_PDB_model_num")
+        if model is not None and len(model[0]) > 1:
+            rows = rows[model[1] == model[1][0]]
+    n_atoms = len(rows)
 
     if n_atoms != len(result.atom_qscores):
         raise ValueError(
-            f"Atom count mismatch: CIF has {n_atoms} atoms, "
+            f"Atom count mismatch: CIF first model has {n_atoms} atoms, "
             f"result has {len(result.atom_qscores)}. "
             "Input CIF must not be modified between run() and write_qscore_cif()."
         )
 
-    # Map result.atom_records (gemmi order) to the rows of the CIF loop.  The
-    # orders can differ: gemmi.read_structure() groups ligand residues with
-    # their parent chain, while many CIF files list all polymer chains first,
-    # then all ligands.  Atoms are matched by position, parsed from the same
-    # text by gemmi and numpy (both round correctly, so the floats are
-    # equal); atoms at one position are taken in order of appearance.  This
-    # needs none of the auth_*/label_* identifier columns, which differ
-    # between writers (python-ihm omits auth_atom_id).
-    cif_xyz = np.column_stack([
-        np.fromiter(block.find_values(f"_atom_site.Cartn_{c}"), dtype=np.float64, count=n_atoms)
-        for c in "xyz"
-    ])
+    idx = slice(None) if n_atoms == n_total else rows
+    cif_xyz = np.column_stack([columns.floats(f"Cartn_{c}")[idx] for c in "xyz"])
     atoms = result.atom_records
     res_xyz = np.fromiter((c for a in atoms for c in (a.x, a.y, a.z)),
                           dtype=np.float64, count=3 * len(atoms)).reshape(-1, 3)
+
+    # Fast check for duplicate (x, y, z) rows: if every position is unique, any
+    # coordinate-preserving bijection is unique and no string columns are needed.
+    def _has_duplicate_xyz(xyz: np.ndarray) -> bool:
+        if len(xyz) < 2:
+            return False
+        # Elementwise projection (deterministic per row without BLAS)
+        proj = xyz[:, 0] + xyz[:, 1] * 1.131370849898476 + xyz[:, 2] * 1.272019649514069
+        order = np.argsort(proj)
+        sp = proj[order]
+        eq = np.flatnonzero(sp[1:] == sp[:-1])
+        if len(eq) == 0:
+            return False
+        if np.any(np.all(xyz[order[eq]] == xyz[order[eq + 1]], axis=1)):
+            return True
+        cand = np.unique(np.concatenate([order[eq], order[eq + 1]]))
+        sub = xyz[cand]
+        so = np.lexsort(sub.T[::-1])
+        return bool(np.any(np.all(sub[so[1:]] == sub[so[:-1]], axis=1)))
+
     if np.array_equal(cif_xyz, res_xyz):
-        row_of_atom = np.arange(n_atoms)
+        cif_order = None
+        has_dup = _has_duplicate_xyz(cif_xyz)
     else:
         cif_order = np.lexsort(cif_xyz.T[::-1])
-        res_order = np.lexsort(res_xyz.T[::-1])
-        if not np.array_equal(cif_xyz[cif_order], res_xyz[res_order]):
-            raise ValueError(
-                f"Atom positions in {input_cif_path} differ from those of the result. "
-                "Input CIF must not be modified between run() and write_qscore_cif()."
+        has_dup = len(cif_xyz) >= 2 and bool(
+            np.any(np.all(cif_xyz[cif_order[1:]] == cif_xyz[cif_order[:-1]], axis=1))
+        )
+
+    if not has_dup:
+        if cif_order is None:
+            row_of_atom = rows
+        else:
+            res_order = np.lexsort(res_xyz.T[::-1])
+            if not np.array_equal(cif_xyz[cif_order], res_xyz[res_order]):
+                raise ValueError(
+                    f"Atom positions in {input_cif_path} differ from those of the result. "
+                    "Input CIF must not be modified between run() and write_qscore_cif()."
+                )
+            row_of_atom = np.empty(n_atoms, dtype=np.int64)
+            row_of_atom[res_order] = rows[cif_order]
+    else:
+        # Coincident coordinates exist: match by full identity + position so
+        # gemmi reordering (chains or split residues) never swaps Q-scores.
+        def _str_col(auth_tag: str, label_tag: str, blank: str = "") -> list[str]:
+            c = _codes_with_fallback(columns, auth_tag, label_tag)
+            if c is None:
+                return [blank] * n_atoms
+            distinct, code, _ = c
+            return [distinct[i] for i in code[rows].tolist()]
+
+        chains = _str_col("auth_asym_id", "label_asym_id")
+        seqs = [int(v) if _is_signed_int(v) else None for v in _str_col("auth_seq_id", "label_seq_id")]
+        ins_col = columns.codes("pdbx_PDB_ins_code")
+        if ins_col is not None:
+            d_ins, c_ins = ins_col
+            inss = ["" if d_ins[i] in ("?", ".", " ", "") else d_ins[i] for i in c_ins[rows].tolist()]
+        else:
+            inss = [""] * n_atoms
+        comps = _str_col("auth_comp_id", "label_comp_id")
+        anames = _str_col("auth_atom_id", "label_atom_id")
+        alt_col = columns.codes("label_alt_id")
+        if alt_col is not None:
+            d_alt, c_alt = alt_col
+            alts = ["" if d_alt[i] in ("?", ".", " ", "") else d_alt[i] for i in c_alt[rows].tolist()]
+        else:
+            alts = [""] * n_atoms
+
+        buckets: dict = defaultdict(deque)
+        for idx_in_model, row in enumerate(rows.tolist()):
+            key = (
+                float(cif_xyz[idx_in_model, 0]),
+                float(cif_xyz[idx_in_model, 1]),
+                float(cif_xyz[idx_in_model, 2]),
+                chains[idx_in_model],
+                seqs[idx_in_model],
+                inss[idx_in_model],
+                comps[idx_in_model],
+                anames[idx_in_model],
+                alts[idx_in_model],
             )
+            buckets[key].append(row)
+
         row_of_atom = np.empty(n_atoms, dtype=np.int64)
-        row_of_atom[res_order] = cif_order
-    q_by_row = np.empty(n_atoms, dtype=np.float64)
+        matched = True
+        for i, a in enumerate(atoms):
+            key = (a.x, a.y, a.z, a.chain_id, a.res_seq, a.ins_code, a.res_name, a.atom_name, a.alt_loc)
+            q_rows = buckets.get(key)
+            if q_rows:
+                row_of_atom[i] = q_rows.popleft()
+            else:
+                matched = False
+                break
+        if not matched:
+            cif_order = np.lexsort(cif_xyz.T[::-1])
+            res_order = np.lexsort(res_xyz.T[::-1])
+            if not np.array_equal(cif_xyz[cif_order], res_xyz[res_order]):
+                raise ValueError(
+                    f"Atom positions in {input_cif_path} differ from those of the result. "
+                    "Input CIF must not be modified between run() and write_qscore_cif()."
+                )
+            row_of_atom[res_order] = rows[cif_order]
+
+    q_by_row = np.full(n_total, np.nan, dtype=np.float64)
     q_by_row[row_of_atom] = result.atom_qscores
     add_qscore_column(block, q_by_row)
     doc.write_file(out_path)
@@ -1872,12 +2103,17 @@ def _cli() -> None:
     res_qs = residue_qscores(result)
     ch_qs  = chain_qscores(result)
 
+    def _res_sort_key(item):
+        ch, rs, ic, rn = item[0]
+        return (ch, rs is None, rs if rs is not None else 0, ic, rn)
+
     if args.output:
         with open(args.output, "w") as fout:
             fout.write("chain\tres_seq\tres_name\tQ_backbone\tQ_sidechain\tQ_residue\n")
-            for (ch, rs, ic, rn), d in sorted(res_qs.items()):
+            for (ch, rs, ic, rn), d in sorted(res_qs.items(), key=_res_sort_key):
+                rs_str = "?" if rs is None else str(rs)
                 fout.write(
-                    f"{ch}\t{rs}{ic}\t{rn}\t"
+                    f"{ch}\t{rs_str}{ic}\t{rn}\t"
                     f"{d['backbone']:.6f}\t{d['sidechain']:.6f}\t{d['all']:.6f}\n"
                 )
         print(f"Wrote residue Q-scores to {args.output}", file=sys.stderr)
@@ -1894,10 +2130,11 @@ def _cli() -> None:
             print(f"Chain {ch}: Q = {q:.6f}  ({n_heavy[ch]} non-H atoms)")
         print()
         print("chain\tres_seq\tres_name\tQ_backbone\tQ_sidechain\tQ_residue")
-        for (ch, rs, ic, rn), d in heapq.nsmallest(20, res_qs.items()):
+        for (ch, rs, ic, rn), d in heapq.nsmallest(20, res_qs.items(), key=_res_sort_key):
+            rs_str = "?" if rs is None else str(rs)
             bb = f"{d['backbone']:.6f}" if not np.isnan(d['backbone']) else "   -    "
             sc = f"{d['sidechain']:.6f}" if not np.isnan(d['sidechain']) else "   -    "
-            print(f"{ch}\t{rs}{ic}\t{rn}\t{bb}\t{sc}\t{d['all']:.6f}")
+            print(f"{ch}\t{rs_str}{ic}\t{rn}\t{bb}\t{sc}\t{d['all']:.6f}")
 
 
 if __name__ == "__main__":

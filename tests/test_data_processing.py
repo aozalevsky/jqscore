@@ -354,3 +354,27 @@ class TestGpuCellList:
         # 70 atoms in a single cell (> 64 limit) → build returns None
         coords = rng.uniform(1.0, 1.1, size=(70, 3))
         assert _GpuCellList.build(coords, 4.0) is None
+
+    def test_large_coords_non_dyadic_radius_no_missed_neighbours(self):
+        """Binning in float64 must not drop neighbours at large coordinates."""
+        import jax.numpy as jnp
+
+        radius = 3.6
+        coords = np.array(
+            [[9990.0, 0.0, 0.0], [10004.401530, 0.0, 0.0], [10008.001529, 0.0, 0.0]],
+            dtype=np.float64,
+        )
+        cl = _GpuCellList.build(coords, radius)
+        assert cl is not None
+        ref = _NeighbourIndex(cl.sorted_coords, radius)
+        ref_counts = ref.counts(cl.sorted_coords)
+
+        padded = np.vstack([cl.sorted_coords, np.full((1, 3), _FAR)])
+        chi = padded.astype(np.float32)
+        clo = (padded - chi).astype(np.float32)
+        gpu_counts = cl.counts(jnp.asarray(chi), jnp.asarray(clo))
+        np.testing.assert_array_equal(gpu_counts, ref_counts)
+
+    def test_huge_coordinate_span_returns_none_without_overflow(self):
+        coords = np.array([[0.0, 0.0, 0.0], [1e10, 0.0, 0.0]], dtype=np.float64)
+        assert _GpuCellList.build(coords, 4.0) is None

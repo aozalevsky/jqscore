@@ -109,3 +109,54 @@ def test_qscore_column_length_checked():
     doc = gemmi.cif.read(str(XZAK_STRUCTURE))
     with pytest.raises(ValueError):
         add_qscore_column(doc[0], np.zeros(3))
+
+
+def test_add_qscore_column_overwrites_without_duplicate(tmp_path):
+    doc = gemmi.cif.read(_write(tmp_path / "t.cif", ROWS[:2]))
+    add_qscore_column(doc[0], np.array([0.1, 0.2]))
+    add_qscore_column(doc[0], np.array([0.9, np.nan]))
+    loop = doc[0].find_loop("_atom_site.Cartn_x").get_loop()
+    assert list(loop.tags).count("_atom_site.Q-score") == 1
+    assert list(doc[0].find_values("_atom_site.Q-score")) == ["0.900000", "?"]
+
+
+def test_add_qscore_column_single_atom_pair_cif(tmp_path):
+    path = tmp_path / "pair.cif"
+    path.write_text(
+        "data_pair\n"
+        "_atom_site.group_PDB ATOM\n"
+        "_atom_site.id 1\n"
+        "_atom_site.type_symbol C\n"
+        "_atom_site.label_atom_id CA\n"
+        "_atom_site.label_alt_id .\n"
+        "_atom_site.label_comp_id ALA\n"
+        "_atom_site.label_asym_id A\n"
+        "_atom_site.label_entity_id 1\n"
+        "_atom_site.label_seq_id 1\n"
+        "_atom_site.Cartn_x 1.0\n"
+        "_atom_site.Cartn_y 2.0\n"
+        "_atom_site.Cartn_z 3.0\n"
+    )
+    doc = gemmi.cif.read(str(path))
+    add_qscore_column(doc[0], np.array([0.65]))
+    out = tmp_path / "pair_out.cif"
+    doc.write_file(str(out))
+    from jqscore.compare import read_qscores
+    _, q_back = read_qscores(str(out))
+    np.testing.assert_allclose(q_back, [0.65], atol=1e-6)
+
+
+def test_partial_missing_auth_falls_back_per_row(tmp_path):
+    rows = [
+        "ATOM 1 C CA . ALA A 1 1 ? 0.000 0.000 0.000 1.00 10.0 1 A 1",
+        "ATOM 2 H HA . ALA A 1 1 ? 0.500 0.000 0.000 1.00 10.0 ? ? 1",
+        "ATOM 3 C CA . GLY B 1 2 ? 1.000 0.000 0.000 1.00 10.0 ? ? 1",
+    ]
+    _check_against_read_cif(_write(tmp_path / "partial.cif", rows))
+
+
+def test_esd_coordinates_in_atom_site_arrays(tmp_path):
+    rows = [
+        "ATOM 1 C CA . ALA A 1 1 ? 1.234(5) 0.000 0.000 1.00 10.0 1 A 1",
+    ]
+    _check_against_read_cif(_write(tmp_path / "esd.cif", rows))
